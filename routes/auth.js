@@ -277,7 +277,7 @@ router.get('/me', async (req, res) => {
 
     // Fetch fresh user data from database
     const userResult = await pool.query(
-      'SELECT id, name, email, user_type, email_verified, is_active, coins, created_at, last_login, profile_image_url, (SELECT json_agg(d.*) FROM user_documents d WHERE d.user_id = id) as uploaded_documents FROM users WHERE id = $1',
+      'SELECT id, name, email, user_type, email_verified, is_active, approval_status, coins, created_at, last_login, profile_image_url, (SELECT json_agg(d.*) FROM user_documents d WHERE d.user_id = id) as uploaded_documents FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -295,6 +295,7 @@ router.get('/me', async (req, res) => {
         user_type: user.user_type,
         email_verified: user.email_verified || false,
         is_active: user.is_active,
+        approval_status: user.approval_status, // Added this field
         coins: user.coins || 0,
         created_at: user.created_at,
         last_login: user.last_login,
