@@ -50,7 +50,11 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
-app.use(express.json()); // Add this line to parse JSON request bodies
+// Webhook route needs raw body (must be before express.json())
+const webhooksRoutes = require('./routes/webhooks');
+app.use('/api/webhooks', webhooksRoutes);
+
+app.use(express.json()); // Parse JSON request bodies for all other routes
 app.use(attachUser);
 app.use('/api/users', usersRoutes);
 app.use('/api/farms', farmsRoutes);
