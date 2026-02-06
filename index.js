@@ -75,10 +75,18 @@ app.use('/api/admin', adminRouter);
 app.get('/api/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
+    const stripeSecret = process.env.STRIPE_SECRET_KEY;
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    
     res.json({
       status: 'healthy',
       database: 'connected',
-      timestamp: result.rows[0].now
+      timestamp: result.rows[0].now,
+      stripe: {
+        configured: !!stripeSecret,
+        webhookConfigured: !!webhookSecret,
+        secretKeyPrefix: stripeSecret ? stripeSecret.substring(0, 7) + '...' : null
+      }
     });
   } catch (error) {
     console.error('Database health check failed:', error);
@@ -86,6 +94,55 @@ app.get('/api/health', async (req, res) => {
       status: 'unhealthy',
       database: 'disconnected',
       error: error.message
+    });
+  }
+});
+
+// Stripe configuration check endpoint
+app.get('/api/stripe/check', (req, res) => {
+  const stripeSecret = process.env.STRIPE_SECRET_KEY;
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  
+  if (!stripeSecret) {
+    return res.status(503).json({
+      configured: false,
+      error: 'STRIPE_SECRET_KEY not set',
+      message: 'Add STRIPE_SECRET_KEY to Vercel environment variables'
+    });
+  }
+  
+  if (!webhookSecret) {
+    return res.status(503).json({
+      configured: false,
+      error: 'STRIPE_WEBHOOK_SECRET not set',
+      message: 'Add STRIPE_WEBHOOK_SECRET to Vercel environment variables (get from Stripe Dashboard → Webhooks)'
+    });
+  }
+  
+  // Try to initialize Stripe to verify the key format
+  try {
+    const Stripe = require('stripe');
+    const stripe = new Stripe(stripeSecret, { apiVersion: '2023-10-16' });
+    
+    res.json({
+      configured: true,
+      stripe: {
+        secretKeySet: true,
+        secretKeyPrefix: stripeSecret.substring(0, 7) + '...',
+        isTestKey: stripeSecret.startsWith('sk_test_'),
+        isLiveKey: stripeSecret.startsWith('sk_live_')
+      },
+      webhook: {
+        secretSet: true,
+        secretPrefix: webhookSecret.substring(0, 7) + '...'
+      },
+      message: 'Stripe is configured. Purchase intent endpoint: POST /api/coins/purchase-intent (requires auth)'
+    });
+  } catch (err) {
+    res.status(500).json({
+      configured: false,
+      error: 'Stripe initialization failed',
+      message: err.message
     });
   }
 });
