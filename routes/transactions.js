@@ -2,6 +2,15 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 
+// Normalize row so amount/balance_after are numbers (DB may return bigint as string)
+function normalizeTransactionRow(row) {
+    if (!row) return row;
+    const out = { ...row };
+    if (out.amount != null) out.amount = Number(out.amount) || 0;
+    if (out.balance_after != null) out.balance_after = Number(out.balance_after) || 0;
+    return out;
+}
+
 // Get transactions for a user (filtered by user, admin can see all)
 router.get('/', async (req, res) => {
     try {
@@ -30,7 +39,7 @@ router.get('/', async (req, res) => {
                     ORDER BY ct.created_at DESC
                     LIMIT 1000
                 `, [user_id]);
-                return res.json(transactions.rows);
+                return res.json(transactions.rows.map(normalizeTransactionRow));
             } else {
                 // Admin sees all transactions
                 const transactions = await pool.query(`
@@ -50,7 +59,7 @@ router.get('/', async (req, res) => {
                     ORDER BY ct.created_at DESC
                     LIMIT 1000
                 `);
-                return res.json(transactions.rows);
+                return res.json(transactions.rows.map(normalizeTransactionRow));
             }
         }
         
@@ -72,7 +81,7 @@ router.get('/', async (req, res) => {
                 ORDER BY ct.created_at DESC
                 LIMIT 1000
             `, [user.id]);
-            return res.json(transactions.rows);
+            return res.json(transactions.rows.map(normalizeTransactionRow));
         }
         
         // No user - require authentication
@@ -116,7 +125,7 @@ router.get('/:userId', async (req, res) => {
             LIMIT 1000
         `, [userId]);
         
-        res.json(transactions.rows);
+        res.json(transactions.rows.map(normalizeTransactionRow));
     } catch (err) {
         console.error('Error getting user transactions:', err.message);
         res.status(500).json({ error: 'Server Error' });

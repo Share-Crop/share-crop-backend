@@ -42,7 +42,7 @@ router.get('/:userId', async (req, res) => {
             return res.status(404).json({ error: 'User not found' });
         }
         
-        res.json({ coins: result.rows[0].coins });
+        res.json({ coins: Number(result.rows[0].coins) || 0 });
     } catch (err) {
         console.error('Error getting user coins:', err.message);
         res.status(500).json({ error: 'Server Error' });
@@ -78,41 +78,89 @@ router.put('/:userId', async (req, res) => {
 
 // Deduct coins from user's balance
 router.post('/:userId/deduct', async (req, res) => {
+    const client = await pool.connect();
     try {
+        await client.query('BEGIN');
+        
         const { userId } = req.params;
-        const { amount } = req.body;
+        const { amount, reason, refType, refId } = req.body;
+        
+        console.log('[Coin Deduct] Request:', { userId, amount, reason, refType, refId });
         
         if (typeof amount !== 'number' || amount <= 0) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Invalid amount value' });
         }
         
         // Get current balance
-        const currentResult = await pool.query(
+        const currentResult = await client.query(
             'SELECT coins FROM users WHERE id = $1',
             [userId]
         );
         
         if (currentResult.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'User not found' });
         }
         
-        const currentCoins = currentResult.rows[0].coins;
+        const currentCoins = Number(currentResult.rows[0].coins) || 0;
         
         if (currentCoins < amount) {
-            return res.status(400).json({ error: 'Insufficient coins' });
+            await client.query('ROLLBACK');
+            console.log('[Coin Deduct] Insufficient coins:', { userId, currentCoins, requested: amount });
+            return res.status(400).json({ 
+                error: 'Insufficient coins',
+                currentCoins,
+                requested: amount,
+                shortfall: amount - currentCoins
+            });
         }
         
         // Deduct coins
         const newCoins = currentCoins - amount;
-        const result = await pool.query(
+        const updateResult = await client.query(
             'UPDATE users SET coins = $1 WHERE id = $2 RETURNING coins',
             [newCoins, userId]
         );
         
-        res.json({ coins: result.rows[0].coins, deducted: amount });
+        // Create transaction record
+        try {
+            await client.query(
+                `INSERT INTO coin_transactions (user_id, type, amount, balance_after, reason, ref_type, ref_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [
+                    userId,
+                    'debit',
+                    amount,
+                    newCoins,
+                    reason || 'Field purchase',
+                    refType || 'order',
+                    refId || null
+                ]
+            );
+            console.log('[Coin Deduct] Transaction recorded:', { userId, amount, newCoins });
+        } catch (txError) {
+            // Log error but don't fail the deduction if transaction table has issues
+            console.error('[Coin Deduct] Failed to create transaction record:', txError.message);
+        }
+        
+        await client.query('COMMIT');
+        
+        console.log('[Coin Deduct] Success:', { userId, deducted: amount, balanceBefore: currentCoins, balanceAfter: newCoins });
+        
+        res.json({ 
+            coins: updateResult.rows[0].coins, 
+            deducted: amount,
+            balanceBefore: currentCoins,
+            balanceAfter: newCoins
+        });
     } catch (err) {
-        console.error('Error deducting coins:', err.message);
-        res.status(500).json({ error: 'Server Error' });
+        await client.query('ROLLBACK');
+        console.error('[Coin Deduct] Error:', err.message);
+        console.error('[Coin Deduct] Stack:', err.stack);
+        res.status(500).json({ error: 'Server Error', message: err.message });
+    } finally {
+        client.release();
     }
 });
 
@@ -136,7 +184,7 @@ router.post('/:userId/add', async (req, res) => {
             return res.status(404).json({ error: 'User not found' });
         }
         
-        const currentCoins = currentResult.rows[0].coins;
+        const currentCoins = Number(currentResult.rows[0].coins) || 0;
         const newCoins = currentCoins + amount;
         
         const result = await pool.query(
@@ -204,18 +252,30 @@ router.post('/purchase-intent', async (req, res) => {
         }
 
         // Insert purchase record (pending status)
+        // Use existing schema: farmer_id, amount, coins_purchased, payment_ref (to avoid breaking existing code)
+        console.log('[Purchase Intent] Creating purchase record:', {
+            userId: req.user.id,
+            packId: pack.id,
+            coins: pack.coins,
+            amount: pack.usdCents / 100,
+            sessionId: session.id
+        });
+        
         const insertResult = await pool.query(
-            `INSERT INTO coin_purchases (user_id, amount_usd_cents, coins_granted, currency, stripe_session_id, status)
+            `INSERT INTO coin_purchases (farmer_id, amount, coins_purchased, currency, payment_ref, status)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id`,
-            [req.user.id, pack.usdCents, pack.coins, 'usd', session.id, 'pending']
+            [req.user.id, pack.usdCents / 100, pack.coins, 'usd', session.id, 'pending']
         );
 
         if (insertResult.rows.length === 0) {
-            console.error('Failed to insert coin_purchase');
+            console.error('[Purchase Intent] Failed to insert coin_purchase');
             return res.status(500).json({ error: 'Failed to record purchase' });
         }
 
+        console.log('[Purchase Intent] Purchase recorded successfully. ID:', insertResult.rows[0].id);
+        console.log('[Purchase Intent] Redirecting to Stripe Checkout:', session.url);
+        
         return res.json({ url: session.url, sessionId: session.id });
     } catch (err) {
         console.error('Error creating purchase intent:', err.message);
