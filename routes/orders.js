@@ -119,6 +119,87 @@ router.get('/farmer-orders', async (req, res) => {
     }
 });
 
+// Get orders for a specific farmer with full details (orders received on their fields) - same shape as buyer endpoint
+router.get('/farmer/:farmerId', async (req, res) => {
+    try {
+        const { farmerId } = req.params;
+        const user = req.user;
+
+        if (user && user.user_type !== 'admin' && user.id !== farmerId) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const farmerOrders = await pool.query(`
+            SELECT 
+                o.id,
+                o.quantity,
+                o.total_price,
+                o.status,
+                o.created_at,
+                o.selected_harvest_date,
+                o.selected_harvest_label,
+                o.mode_of_shipping,
+                f.id as field_id,
+                f.name as field_name,
+                f.location,
+                f.category as crop_type,
+                f.available_area,
+                f.total_area,
+                f.price_per_m2,
+                f.image as image_url,
+                f.owner_id as farmer_id,
+                buyer.name as buyer_name,
+                buyer.email as buyer_email
+            FROM orders o
+            JOIN fields f ON o.field_id = f.id
+            LEFT JOIN users buyer ON o.buyer_id = buyer.id
+            WHERE f.owner_id = $1
+            ORDER BY o.created_at DESC
+        `, [farmerId]);
+
+        res.json(farmerOrders.rows);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+
+// Update only order status (for farmer workflow)
+router.put('/:id/status', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+        const user = req.user;
+
+        // Must match DB constraint orders_status_check: pending, active, completed, cancelled only
+        if (!status || !['pending', 'active', 'completed', 'cancelled'].includes(status)) {
+            return res.status(400).json({ error: 'Invalid status. Allowed: pending, active, completed, cancelled' });
+        }
+
+        const orderResult = await pool.query(
+            'SELECT o.id, f.owner_id as farmer_id FROM orders o JOIN fields f ON o.field_id = f.id WHERE o.id = $1',
+            [id]
+        );
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        const { farmer_id } = orderResult.rows[0];
+
+        if (user && user.user_type !== 'admin' && user.id !== farmer_id) {
+            return res.status(403).json({ error: 'Only the field owner or admin can update order status' });
+        }
+
+        const result = await pool.query(
+            'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
+            [status, id]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+
 // Get orders for current authenticated user (my-orders) - MUST come before /:id route
 router.get('/my-orders', async (req, res) => {
     try {
@@ -279,6 +360,9 @@ router.put('/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const { buyer_id, field_id, quantity, total_price, status, mode_of_shipping } = req.body;
+        if (status != null && !['pending', 'active', 'completed', 'cancelled'].includes(status)) {
+            return res.status(400).json({ error: 'Invalid status. Allowed: pending, active, completed, cancelled' });
+        }
         const result = await pool.query(
             'UPDATE orders SET buyer_id = $1, field_id = $2, quantity = $3, total_price = $4, status = $5, mode_of_shipping = $6 WHERE id = $7 RETURNING *',
             [buyer_id, field_id, quantity, total_price, status, mode_of_shipping, id]

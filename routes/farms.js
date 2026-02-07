@@ -69,22 +69,43 @@ router.post('/', async (req, res) => {
     }
 });
 
-// Update a farm
+// Map camelCase (frontend) to snake_case (DB) for farm update
+function mapFarmBodyToRow(body) {
+    const out = {};
+    if (!body || typeof body !== 'object') return out;
+    if (body.farmName !== undefined) out.farm_name = body.farmName;
+    if (body.farmIcon !== undefined) out.farm_icon = body.farmIcon;
+    if (body.webcamUrl !== undefined) out.webcam_url = body.webcamUrl;
+    return out;
+}
+
+// Update a farm (merge with existing so partial updates don't null out fields)
 router.put('/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, location, owner_id, farmIcon, coordinates, webcamUrl, description } = req.body;
-        
-        // Properly stringify coordinates for JSONB storage
+        const existing = await pool.query('SELECT * FROM farms WHERE id = $1', [id]);
+        if (existing.rows.length === 0) {
+            return res.status(404).json({ msg: 'Farm not found' });
+        }
+        const mapped = mapFarmBodyToRow(req.body);
+        const row = { ...existing.rows[0], ...mapped, ...req.body };
+        const existingRow = existing.rows[0];
+
+        // Use existing values when merged value is null/undefined so we never violate NOT NULL
+        const name = (row.farm_name ?? row.name) ?? (existingRow.farm_name ?? existingRow.name);
+        const location = row.location ?? existingRow.location;
+        const owner_id = row.owner_id ?? existingRow.owner_id;
+        const farmIcon = (row.farm_icon ?? row.farmIcon) ?? (existingRow.farm_icon ?? existingRow.farmIcon);
+        const coordinates = row.coordinates ?? existingRow.coordinates;
+        const webcamUrl = (row.webcam_url ?? row.webcamUrl) ?? (existingRow.webcam_url ?? existingRow.webcamUrl);
+        const description = row.description ?? existingRow.description;
+
         const coordinatesJson = coordinates ? JSON.stringify(coordinates) : null;
-        
+
         const updateFarm = await pool.query(
             "UPDATE farms SET farm_name = $1, location = $2, owner_id = $3, farm_icon = $4, coordinates = $5, webcam_url = $6, description = $7 WHERE id = $8 RETURNING *",
             [name, location, owner_id, farmIcon, coordinatesJson, webcamUrl, description, id]
         );
-        if (updateFarm.rows.length === 0) {
-            return res.status(404).json({ msg: 'Farm not found' });
-        }
         res.json(updateFarm.rows[0]);
     } catch (err) {
         console.error('Error updating farm:', err.message);
