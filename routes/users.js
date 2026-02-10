@@ -282,11 +282,14 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// Update a user's profile image
+// Update a user's profile image (user can only update their own)
 router.patch('/:id/profile-image', async (req, res) => {
   try {
     const { id } = req.params;
     const { profile_image_url } = req.body;
+    if (req.user && req.user.id !== id) {
+      return res.status(403).json({ error: 'You can only update your own profile image' });
+    }
     const result = await pool.query(
       'UPDATE users SET profile_image_url = $1 WHERE id = $2 RETURNING *',
       [profile_image_url, id]

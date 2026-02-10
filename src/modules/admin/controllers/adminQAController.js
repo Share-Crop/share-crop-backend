@@ -22,6 +22,8 @@ async function listComplaints(req, res) {
         c.description,
         c.status,
         c.admin_remarks,
+        c.refund_coins,
+        c.refunded_at,
         c.created_at,
         c.updated_at
       FROM complaints c
@@ -114,4 +116,87 @@ async function updateComplaintRemarks(req, res) {
   }
 }
 
-module.exports = { listComplaints, updateComplaintStatus, updateComplaintRemarks };
+/**
+ * POST /api/admin/qa/complaints/:id/refund
+ * Credit coins to the complainant (victim) as fraud refund. Admin only.
+ * Body: { coins: number }
+ */
+async function refundComplaint(req, res) {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { coins: amount } = req.body || {};
+    const numAmount = typeof amount === 'number' ? amount : (parseInt(amount, 10));
+    if (!Number.isInteger(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid or missing coins amount (positive integer required)' });
+    }
+
+    await client.query('BEGIN');
+
+    const comp = await client.query(
+      'SELECT id, created_by, refunded_at FROM complaints WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    if (comp.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Complaint not found' });
+    }
+    const complaint = comp.rows[0];
+    if (complaint.refunded_at) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This complaint has already been refunded' });
+    }
+
+    const userId = complaint.created_by;
+    const balanceResult = await client.query(
+      'SELECT coins FROM users WHERE id = $1 FOR UPDATE',
+      [userId]
+    );
+    if (balanceResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Complainant user not found' });
+    }
+    const currentCoins = Number(balanceResult.rows[0].coins) || 0;
+    const newCoins = currentCoins + numAmount;
+
+    await client.query(
+      'UPDATE users SET coins = $1 WHERE id = $2',
+      [newCoins, userId]
+    );
+    await client.query(
+      `UPDATE complaints SET refund_coins = $2, refunded_at = now(), status = 'resolved', updated_at = now() WHERE id = $1`,
+      [id, numAmount]
+    );
+
+    // Mandatory: record in coin_transactions for audit and user history
+    await client.query(
+      `INSERT INTO coin_transactions (user_id, type, amount, reason, balance_after, ref_type, ref_id)
+       VALUES ($1, 'credit', $2, $3, $4, 'complaint', $5)`,
+      [userId, numAmount, 'complaint_refund', newCoins, id]
+    );
+
+    await client.query('COMMIT');
+
+    const adminId = req.user?.id || null;
+    console.log('[refundComplaint] Recorded: complaint_id=%s user_id=%s coins=%s balance_after=%s admin_id=%s',
+      id, userId, numAmount, newCoins, adminId || 'n/a');
+
+    res.json({
+      id,
+      refund_coins: numAmount,
+      user_id: userId,
+      balance_before: currentCoins,
+      balance_after: newCoins,
+      message: 'Refund credited to complainant successfully',
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    ensureTable(err, 'complaints');
+    const statusCode = err.status || 500;
+    res.status(statusCode).json({ error: err.message || 'Server Error' });
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { listComplaints, updateComplaintStatus, updateComplaintRemarks, refundComplaint };

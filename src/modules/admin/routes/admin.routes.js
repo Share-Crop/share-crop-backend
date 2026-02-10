@@ -24,6 +24,7 @@ router.get('/production/consistency', adminMonitoringController.getProductionCon
 router.get('/qa/complaints', adminQAController.listComplaints);
 router.patch('/qa/complaints/:id', adminQAController.updateComplaintStatus);
 router.patch('/qa/complaints/:id/remarks', adminQAController.updateComplaintRemarks);
+router.post('/qa/complaints/:id/refund', adminQAController.refundComplaint);
 
 
 
