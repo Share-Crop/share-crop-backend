@@ -59,56 +59,79 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
         }
 
         const userId = existing.user_id;
-        // Ensure numeric: DB may return coins_granted/coins_purchased as string (e.g. bigint), which would cause 90 + "100" => "90100"
         const coinsToAdd = Number(existing.coins_granted) || 0;
 
-        // Get current user balance
-        const userResult = await pool.query(
-            'SELECT coins FROM users WHERE id = $1',
-            [userId]
-        );
-
-        if (userResult.rows.length === 0) {
-            console.error('User not found:', userId);
-            return res.status(500).send('User not found');
-        }
-
-        const balanceBefore = Number(userResult.rows[0].coins) || 0;
-        const balanceAfter = balanceBefore + coinsToAdd;
-        
-        console.log('[Webhook] Crediting coins:', { userId, coinsToAdd, balanceBefore, balanceAfter });
-
-        // Update user coins
-        await pool.query(
-            'UPDATE users SET coins = $1 WHERE id = $2',
-            [balanceAfter, userId]
-        );
-        
-        console.log('[Webhook] User coins updated successfully');
-
-        // Insert coin_transaction (audit trail)
-        await pool.query(
-            `INSERT INTO coin_transactions (user_id, type, amount, balance_after, reason, ref_type, ref_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [userId, 'credit', coinsToAdd, balanceAfter, 'Coin purchase', 'coin_purchase', existing.id]
-        );
-
-        // Mark purchase as completed (completed_at may not exist in schema)
+        // Use transaction with FOR UPDATE for atomicity
+        const client = await pool.connect();
         try {
-            await pool.query(
-                'UPDATE coin_purchases SET status = $1, completed_at = NOW() WHERE id = $2',
-                ['completed', existing.id]
+            await client.query('BEGIN');
+
+            // Lock purchase row (already checked, but lock for consistency)
+            const purchaseLock = await client.query(
+                'SELECT id, status FROM coin_purchases WHERE id = $1 FOR UPDATE',
+                [existing.id]
             );
-        } catch (err) {
-            // If completed_at doesn't exist, just update status
-            if (err.message && err.message.includes('completed_at')) {
-                await pool.query(
-                    'UPDATE coin_purchases SET status = $1 WHERE id = $2',
+
+            if (purchaseLock.rows.length === 0 || purchaseLock.rows[0].status === 'completed') {
+                await client.query('ROLLBACK');
+                return res.json({ received: true, already_processed: true });
+            }
+
+            // Lock user row and get current balance
+            const userResult = await client.query(
+                'SELECT coins FROM users WHERE id = $1 FOR UPDATE',
+                [userId]
+            );
+
+            if (userResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                console.error('User not found:', userId);
+                return res.status(500).send('User not found');
+            }
+
+            const balanceBefore = Number(userResult.rows[0].coins) || 0;
+            const balanceAfter = balanceBefore + coinsToAdd;
+            
+            console.log('[Webhook] Crediting coins:', { userId, coinsToAdd, balanceBefore, balanceAfter });
+
+            // Update user coins
+            await client.query(
+                'UPDATE users SET coins = $1 WHERE id = $2',
+                [balanceAfter, userId]
+            );
+
+            // Insert coin_transaction (audit trail)
+            await client.query(
+                `INSERT INTO coin_transactions (user_id, type, amount, balance_after, reason, ref_type, ref_id, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [userId, 'credit', coinsToAdd, balanceAfter, 'Coin purchase', 'coin_purchase', existing.id, 'completed']
+            );
+
+            // Mark purchase as completed
+            try {
+                await client.query(
+                    'UPDATE coin_purchases SET status = $1, completed_at = NOW() WHERE id = $2',
                     ['completed', existing.id]
                 );
-            } else {
-                throw err;
+            } catch (err) {
+                // If completed_at doesn't exist, just update status
+                if (err.message && err.message.includes('completed_at')) {
+                    await client.query(
+                        'UPDATE coin_purchases SET status = $1 WHERE id = $2',
+                        ['completed', existing.id]
+                    );
+                } else {
+                    throw err;
+                }
             }
+
+            await client.query('COMMIT');
+            console.log('[Webhook] Successfully processed payment for session:', sessionId);
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
         }
 
         console.log('[Webhook] Successfully processed payment for session:', sessionId);

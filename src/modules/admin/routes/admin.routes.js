@@ -59,4 +59,9 @@ router.get('/coins/usage', adminFinanceController.getCoinTransactions);
 router.get('/payments', adminFinanceController.getPayments);
 router.get('/audit/logs', adminAuditController.getAuditLogs);
 
+// Redemptions (approve/reject)
+const adminRedemptionController = require('../controllers/adminRedemptionController');
+router.get('/redemptions', adminRedemptionController.listRedemptions);
+router.patch('/redemptions/:id', adminRedemptionController.updateRedemption);
+
 module.exports = router;
