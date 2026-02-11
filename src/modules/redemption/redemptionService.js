@@ -1,7 +1,8 @@
 const pool = require('../../../db');
 
 // Configuration from environment variables
-const REDEMPTION_COINS_PER_USD = parseFloat(process.env.REDEMPTION_COINS_PER_USD || '100');
+// 1 coin = 1 USD dollar
+const REDEMPTION_COINS_PER_USD = parseFloat(process.env.REDEMPTION_COINS_PER_USD || '1');
 const REDEMPTION_PLATFORM_FEE_PERCENT = parseFloat(process.env.REDEMPTION_PLATFORM_FEE_PERCENT || '20');
 const REDEMPTION_MIN_COINS = parseInt(process.env.REDEMPTION_MIN_COINS || '1000');
 const REDEMPTION_MAX_COINS = parseInt(process.env.REDEMPTION_MAX_COINS || '1000000');
@@ -51,9 +52,9 @@ async function createRedemptionRequest(userId, coinsRequested, payoutMethodId) {
       }
     }
 
-    // Lock user row and get current balance
+    // Lock user row and get current balance and preferred currency
     const userResult = await client.query(
-      'SELECT coins, locked_coins FROM users WHERE id = $1 FOR UPDATE',
+      'SELECT coins, locked_coins, preferred_currency FROM users WHERE id = $1 FOR UPDATE',
       [userId]
     );
     if (userResult.rows.length === 0) {
@@ -63,6 +64,7 @@ async function createRedemptionRequest(userId, coinsRequested, payoutMethodId) {
 
     const currentCoins = Number(userResult.rows[0].coins) || 0;
     const currentLocked = Number(userResult.rows[0].locked_coins) || 0;
+    const userCurrency = userResult.rows[0]?.preferred_currency || 'USD';
 
     // Validate sufficient balance
     if (currentCoins < coinsRequested) {
@@ -92,7 +94,7 @@ async function createRedemptionRequest(userId, coinsRequested, payoutMethodId) {
         platform_fee_cents, payout_amount_cents, payout_method_id, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id, status, payout_amount_cents, created_at`,
-      [userId, coinsRequested, conversionRate, 'USD', fiatAmountCents, 
+      [userId, coinsRequested, conversionRate, userCurrency, fiatAmountCents, 
        platformFeeCents, payoutAmountCents, payoutMethodId || null, 'pending']
     );
 

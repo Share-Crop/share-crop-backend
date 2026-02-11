@@ -44,7 +44,7 @@ function isValidPassword(password) {
  */
 router.post('/signup', async (req, res) => {
   try {
-    const { name, email, password, user_type, profile_image_url, documents } = req.body;
+    const { name, email, password, user_type, profile_image_url, documents, preferred_currency } = req.body;
 
     // Validation
     if (!name || name.trim().length === 0) {
@@ -86,11 +86,24 @@ router.post('/signup', async (req, res) => {
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
+    // Validate preferred_currency if provided
+    let currencyToUse = 'USD'; // Default
+    if (preferred_currency) {
+      // Check if currency exists in currency_rates
+      const currencyCheck = await pool.query(
+        'SELECT currency FROM currency_rates WHERE currency = $1 AND is_active = true',
+        [preferred_currency.toUpperCase()]
+      );
+      if (currencyCheck.rows.length > 0) {
+        currencyToUse = preferred_currency.toUpperCase();
+      }
+    }
+
     // Create user (using PostgreSQL's gen_random_uuid())
     const result = await pool.query(
-      `INSERT INTO users (id, name, email, password, user_type, email_verified, is_active, created_at, profile_image_url)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), $7)
-       RETURNING id, name, email, user_type, created_at, email_verified, is_active, profile_image_url`,
+      `INSERT INTO users (id, name, email, password, user_type, email_verified, is_active, created_at, profile_image_url, preferred_currency)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), $7, $8)
+       RETURNING id, name, email, user_type, created_at, email_verified, is_active, profile_image_url, preferred_currency`,
       [
         name.trim(),
         email.toLowerCase().trim(),
@@ -98,7 +111,8 @@ router.post('/signup', async (req, res) => {
         normalizedUserType,
         false, // email_verified (skip for now)
         true,  // is_active
-        profile_image_url || null
+        profile_image_url || null,
+        currencyToUse
       ]
     );
 

@@ -2,39 +2,69 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const redemptionService = require('../src/modules/redemption/redemptionService');
+const packageService = require('../src/modules/coins/packageService');
 const authenticate = require('../src/middleware/auth/authenticate');
-
-// Coin packs configuration
-const COIN_PACKS = [
-  { id: 'pack_small', coins: 100, usdCents: 999 },
-  { id: 'pack_medium', coins: 500, usdCents: 4499 },
-  { id: 'pack_large', coins: 1200, usdCents: 9999 },
-  { id: 'pack_xlarge', coins: 2500, usdCents: 19999 },
-];
 
 // ============================================================================
 // SPECIFIC ROUTES (MUST be before /:userId route to avoid route conflicts)
 // ============================================================================
 
-// Get coin packs for purchase
+// Get coin packs for purchase (uses dynamic packages from database)
 router.get('/packs', async (req, res) => {
     try {
-        res.json({
-            packs: COIN_PACKS.map((p) => ({
-                id: p.id,
-                coins: p.coins,
-                usdCents: p.usdCents,
-                usd: (p.usdCents / 100).toFixed(2),
-            })),
+        const { currency } = req.query; // Optional currency filter
+        
+        const packages = await packageService.getActivePackages(currency);
+        
+        // Format for frontend compatibility
+        const packs = packages.map((pkg) => {
+            // Parse decimal values from database (they come as strings)
+            const discountedPrice = parseFloat(pkg.discounted_price) || 0;
+            const price = parseFloat(pkg.price) || 0;
+            const discountPercent = parseFloat(pkg.discount_percent) || 0;
+            const pricePerCoin = parseFloat(pkg.price_per_coin) || 0;
+            const discountedPricePerCoin = parseFloat(pkg.discounted_price_per_coin) || 0;
+            
+            const priceInCents = Math.round(discountedPrice * 100);
+            return {
+                id: pkg.id,
+                name: pkg.name,
+                description: pkg.description,
+                coins: pkg.coins,
+                price: price,
+                discountedPrice: discountedPrice,
+                currency: pkg.currency,
+                currencySymbol: pkg.currency_symbol,
+                discountPercent: discountPercent,
+                pricePerCoin: pricePerCoin,
+                discountedPricePerCoin: discountedPricePerCoin,
+                isFeatured: pkg.is_featured,
+                // Legacy format for backward compatibility
+                usdCents: pkg.currency === 'USD' ? priceInCents : null,
+                usd: pkg.currency === 'USD' ? discountedPrice.toFixed(2) : null,
+            };
         });
+        
+        res.json({ packs });
     } catch (err) {
         console.error('Error getting coin packs:', err.message);
-        res.status(500).json({ error: 'Server Error' });
+        res.status(500).json({ error: 'Server Error', message: err.message });
     }
 });
 
-// Create purchase intent (Stripe Checkout)
-router.post('/purchase-intent', async (req, res) => {
+// Get currency rates (for frontend display)
+router.get('/currency-rates', async (req, res) => {
+    try {
+        const rates = await packageService.getCurrencyRates();
+        res.json({ rates });
+    } catch (err) {
+        console.error('Error getting currency rates:', err.message);
+        res.status(500).json({ error: 'Server Error', message: err.message });
+    }
+});
+
+// Create purchase intent (Stripe Checkout) - Updated to use dynamic packages
+router.post('/purchase-intent', authenticate, async (req, res) => {
     try {
         // Check if user is authenticated
         if (!req.user || !req.user.id) {
@@ -49,8 +79,67 @@ router.post('/purchase-intent', async (req, res) => {
         }
         const stripe = new Stripe(stripeSecret, { apiVersion: '2023-10-16' });
 
-        const { pack_id, success_url, cancel_url } = req.body || {};
-        const pack = COIN_PACKS.find((p) => p.id === pack_id) || COIN_PACKS[0];
+        const { pack_id, custom_coins, currency, success_url, cancel_url } = req.body || {};
+        
+        let pack;
+        let coins;
+        let finalPrice;
+        let currencyCode;
+        
+        // Handle custom coin purchase
+        if (custom_coins && !pack_id) {
+            // Use user's preferred currency if not specified
+            let currencyToUse = currency;
+            if (!currencyToUse) {
+                const userResult = await pool.query(
+                    'SELECT preferred_currency FROM users WHERE id = $1',
+                    [req.user.id]
+                );
+                currencyToUse = userResult.rows[0]?.preferred_currency || 'USD';
+            }
+            
+            coins = parseInt(custom_coins);
+            if (isNaN(coins) || coins < 1) {
+                return res.status(400).json({ error: 'Invalid coin amount' });
+            }
+            
+            // Get currency rate
+            const coinsPerUnit = await packageService.getCoinsPerCurrencyUnit(currencyToUse);
+            currencyCode = currencyToUse.toUpperCase();
+            
+            // Calculate price: coins / coins_per_unit
+            // e.g., if 1 USD = 1 coin, then 100 coins = $100
+            finalPrice = coins / coinsPerUnit;
+        } else {
+            // Handle package purchase
+            if (!pack_id) {
+                return res.status(400).json({ error: 'pack_id is required' });
+            }
+            
+            // Get package from database
+            try {
+                pack = await packageService.getPackageById(pack_id);
+            } catch (err) {
+                return res.status(404).json({ error: 'Package not found', message: err.message });
+            }
+            
+            if (!pack.is_active) {
+                return res.status(400).json({ error: 'Package is not active' });
+            }
+            
+            coins = pack.coins;
+            currencyCode = pack.currency;
+            finalPrice = pack.discounted_price;
+        }
+        
+        const priceInCents = Math.round(finalPrice * 100);
+        
+        // Get currency rate for description
+        const coinsPerUnit = await packageService.getCoinsPerCurrencyUnit(currencyCode);
+        const currencyRates = await packageService.getCurrencyRates();
+        const rateInfo = currencyRates.find(r => r.currency === currencyCode);
+        const currencySymbol = rateInfo?.symbol || currencyCode;
+        const conversionText = `${coinsPerUnit} coins = ${currencySymbol}1.00`;
         
         // Default success/cancel URLs
         const finalSuccess = success_url || process.env.SUCCESS_URL || 'http://localhost:3000/farmer/buy-coins?success=1';
@@ -59,16 +148,22 @@ router.post('/purchase-intent', async (req, res) => {
         // Create Stripe Checkout Session
         let session;
         try {
+            const productName = pack 
+                ? (pack.discount_percent > 0 
+                    ? `${pack.name} - ${pack.coins} Coins (${pack.discount_percent}% OFF)`
+                    : `${pack.name} - ${pack.coins} Coins`)
+                : `${coins} Custom Coins`;
+            
             session = await stripe.checkout.sessions.create({
                 payment_method_types: ['card'],
                 line_items: [
                     {
                         price_data: {
-                            currency: 'usd',
-                            unit_amount: pack.usdCents,
+                            currency: currencyCode.toLowerCase(),
+                            unit_amount: priceInCents,
                             product_data: {
-                                name: `${pack.coins} ShareCrop Coins`,
-                                description: '1 coin = $100 in-app value',
+                                name: productName,
+                                description: pack?.description || conversionText,
                             },
                         },
                         quantity: 1,
@@ -78,27 +173,37 @@ router.post('/purchase-intent', async (req, res) => {
                 success_url: (finalSuccess.includes('?') ? finalSuccess + '&' : finalSuccess + '?') + 'session_id={CHECKOUT_SESSION_ID}',
                 cancel_url: finalCancel,
                 client_reference_id: req.user.id,
-                metadata: { user_id: req.user.id, pack_id: pack.id, coins: String(pack.coins) },
+                metadata: { 
+                    user_id: req.user.id, 
+                    package_id: pack?.id || null,
+                    pack_id: pack?.id || null, // Legacy support
+                    coins: String(coins),
+                    currency: currencyCode,
+                    is_custom: pack ? 'false' : 'true'
+                },
             });
         } catch (err) {
             console.error('Stripe session create error:', err);
-            return res.status(500).json({ error: 'Could not create checkout session' });
+            return res.status(500).json({ error: 'Could not create checkout session', message: err.message });
         }
 
         // Insert purchase record (pending status)
         console.log('[Purchase Intent] Creating purchase record:', {
             userId: req.user.id,
-            packId: pack.id,
-            coins: pack.coins,
-            amount: pack.usdCents / 100,
-            sessionId: session.id
+            packageId: pack?.id || 'custom',
+            packageName: pack?.name || 'Custom Coins',
+            coins: coins,
+            amount: finalPrice,
+            currency: currencyCode,
+            sessionId: session.id,
+            isCustom: !pack
         });
         
         const insertResult = await pool.query(
-            `INSERT INTO coin_purchases (farmer_id, amount, coins_purchased, currency, payment_ref, status)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            `INSERT INTO coin_purchases (farmer_id, amount, coins_purchased, currency, payment_ref, status, package_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id`,
-            [req.user.id, pack.usdCents / 100, pack.coins, 'usd', session.id, 'pending']
+            [req.user.id, finalPrice, coins, currencyCode.toLowerCase(), session.id, 'pending', pack?.id || null]
         );
 
         if (insertResult.rows.length === 0) {
@@ -112,7 +217,7 @@ router.post('/purchase-intent', async (req, res) => {
         return res.json({ url: session.url, sessionId: session.id });
     } catch (err) {
         console.error('Error creating purchase intent:', err.message);
-        res.status(500).json({ error: 'Server Error' });
+        res.status(500).json({ error: 'Server Error', message: err.message });
     }
 });
 

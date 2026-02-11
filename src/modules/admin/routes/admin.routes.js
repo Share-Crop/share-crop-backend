@@ -64,4 +64,18 @@ const adminRedemptionController = require('../controllers/adminRedemptionControl
 router.get('/redemptions', adminRedemptionController.listRedemptions);
 router.patch('/redemptions/:id', adminRedemptionController.updateRedemption);
 
+// Coin Packages Management (admin)
+const adminPackageController = require('../controllers/adminPackageController');
+router.get('/packages', adminPackageController.listPackages);
+router.get('/packages/:id', adminPackageController.getPackage);
+router.post('/packages', adminPackageController.createPackage);
+router.patch('/packages/:id', adminPackageController.updatePackage);
+router.delete('/packages/:id', adminPackageController.deletePackage);
+
+// Currency Rates Management (admin)
+router.get('/currency-rates', adminPackageController.listCurrencyRates);
+router.post('/currency-rates', adminPackageController.upsertCurrencyRate);
+router.patch('/currency-rates/:currency', adminPackageController.upsertCurrencyRate);
+router.delete('/currency-rates/:currency', adminPackageController.deleteCurrencyRate);
+
 module.exports = router;

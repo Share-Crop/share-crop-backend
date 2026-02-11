@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db'); // Assuming db.js is in the parent directory
+const authenticate = require('../src/middleware/auth/authenticate');
 
 // Get all users with enhanced stats
 router.get('/', async (req, res) => {
@@ -301,6 +302,69 @@ router.patch('/:id/profile-image', async (req, res) => {
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
+  }
+});
+
+// Get user's preferred currency
+router.get('/:id/preferred-currency', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT preferred_currency FROM users WHERE id = $1',
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json({ preferred_currency: result.rows[0].preferred_currency || 'USD' });
+  } catch (err) {
+    console.error('Error getting preferred currency:', err.message);
+    res.status(500).json({ error: 'Server Error' });
+  }
+});
+
+// Update user's preferred currency (user can only update their own)
+router.patch('/:id/preferred-currency', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { preferred_currency } = req.body;
+    
+    // Check authentication
+    if (!req.user || req.user.id !== id) {
+      return res.status(403).json({ error: 'You can only update your own currency preference' });
+    }
+    
+    if (!preferred_currency) {
+      return res.status(400).json({ error: 'preferred_currency is required' });
+    }
+    
+    // Validate currency exists in currency_rates
+    const currencyCheck = await pool.query(
+      'SELECT currency FROM currency_rates WHERE currency = $1 AND is_active = true',
+      [preferred_currency.toUpperCase()]
+    );
+    
+    if (currencyCheck.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid currency. Please select a currency that is available in the system.' });
+    }
+    
+    const result = await pool.query(
+      'UPDATE users SET preferred_currency = $1 WHERE id = $2 RETURNING id, preferred_currency',
+      [preferred_currency.toUpperCase(), id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({ 
+      success: true,
+      preferred_currency: result.rows[0].preferred_currency,
+      message: 'Currency preference updated successfully'
+    });
+  } catch (err) {
+    console.error('Error updating preferred currency:', err.message);
+    res.status(500).json({ error: 'Server Error', message: err.message });
   }
 });
 

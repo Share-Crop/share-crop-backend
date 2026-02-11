@@ -32,9 +32,12 @@ router.get('/', async (req, res) => {
                         ct.balance_after,
                         ct.ref_type,
                         ct.ref_id,
-                        ct.created_at
+                        ct.created_at,
+                        COALESCE(cp.currency, rr.currency, u.preferred_currency, 'USD') as currency
                     FROM coin_transactions ct
                     LEFT JOIN users u ON u.id = ct.user_id
+                    LEFT JOIN coin_purchases cp ON ct.ref_type = 'coin_purchase' AND ct.ref_id = cp.id
+                    LEFT JOIN redemption_requests rr ON ct.ref_type = 'redemption_request' AND ct.ref_id = rr.id
                     WHERE ct.user_id = $1
                     ORDER BY ct.created_at DESC
                     LIMIT 1000
@@ -53,9 +56,12 @@ router.get('/', async (req, res) => {
                         ct.balance_after,
                         ct.ref_type,
                         ct.ref_id,
-                        ct.created_at
+                        ct.created_at,
+                        COALESCE(cp.currency, rr.currency, u.preferred_currency, 'USD') as currency
                     FROM coin_transactions ct
                     LEFT JOIN users u ON u.id = ct.user_id
+                    LEFT JOIN coin_purchases cp ON ct.ref_type = 'coin_purchase' AND ct.ref_id = cp.id
+                    LEFT JOIN redemption_requests rr ON ct.ref_type = 'redemption_request' AND ct.ref_id = rr.id
                     ORDER BY ct.created_at DESC
                     LIMIT 1000
                 `);
@@ -75,8 +81,12 @@ router.get('/', async (req, res) => {
                     ct.balance_after,
                     ct.ref_type,
                     ct.ref_id,
-                    ct.created_at
+                    ct.created_at,
+                    COALESCE(cp.currency, rr.currency, u.preferred_currency, 'USD') as currency
                 FROM coin_transactions ct
+                LEFT JOIN coin_purchases cp ON ct.ref_type = 'coin_purchase' AND ct.ref_id = cp.id
+                LEFT JOIN redemption_requests rr ON ct.ref_type = 'redemption_request' AND ct.ref_id = rr.id
+                LEFT JOIN users u ON u.id = ct.user_id
                 WHERE ct.user_id = $1
                 ORDER BY ct.created_at DESC
                 LIMIT 1000
@@ -118,8 +128,12 @@ router.get('/:userId', async (req, res) => {
                 ct.balance_after,
                 ct.ref_type,
                 ct.ref_id,
-                ct.created_at
+                ct.created_at,
+                COALESCE(cp.currency, rr.currency, u.preferred_currency, 'USD') as currency
             FROM coin_transactions ct
+            LEFT JOIN users u ON u.id = ct.user_id
+            LEFT JOIN coin_purchases cp ON ct.ref_type = 'coin_purchase' AND ct.ref_id = cp.id
+            LEFT JOIN redemption_requests rr ON ct.ref_type = 'redemption_request' AND ct.ref_id = rr.id
             WHERE ct.user_id = $1
             ORDER BY ct.created_at DESC
             LIMIT 1000
