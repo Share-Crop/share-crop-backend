@@ -1,13 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+const coinService = require('../src/modules/coins/coinService');
+const packageService = require('../src/modules/coins/packageService');
 
 // Get all orders (filtered by user role, admin sees all)
 router.get('/', async (req, res) => {
     try {
         const { buyer_id, farmer_id } = req.query;
         const user = req.user; // From attachUser middleware
-        
+
         // Admin can see all orders (or use query params for filtering)
         if (user && user.user_type === 'admin') {
             if (buyer_id) {
@@ -32,7 +34,7 @@ router.get('/', async (req, res) => {
                 return res.json(allOrders.rows);
             }
         }
-        
+
         // Buyer sees only their orders
         if (user && user.user_type === 'buyer') {
             const buyerOrders = await pool.query(
@@ -41,7 +43,7 @@ router.get('/', async (req, res) => {
             );
             return res.json(buyerOrders.rows);
         }
-        
+
         // Farmer sees orders on their fields (use farmer-orders endpoint for better data)
         if (user && user.user_type === 'farmer') {
             const farmerOrders = await pool.query(`
@@ -52,12 +54,12 @@ router.get('/', async (req, res) => {
             `, [user.id]);
             return res.json(farmerOrders.rows);
         }
-        
+
         // No user or unknown role - return empty or require authentication
         if (!user) {
             return res.status(401).json({ error: 'Authentication required' });
         }
-        
+
         // Fallback: return empty array for unknown roles
         res.json([]);
     } catch (err) {
@@ -71,19 +73,19 @@ router.get('/farmer-orders', async (req, res) => {
     try {
         const { farmerId } = req.query;
         const user = req.user; // From attachUser middleware
-        
+
         // If farmerId not provided, use authenticated user's ID
         const targetFarmerId = farmerId || (user && user.user_type === 'farmer' ? user.id : null);
-        
+
         if (!targetFarmerId) {
             return res.status(400).json({ error: 'Farmer ID is required' });
         }
-        
+
         // Check authorization: farmer can only see their own orders, admin can see any
         if (user && user.user_type !== 'admin' && user.id !== targetFarmerId) {
             return res.status(403).json({ error: 'Access denied' });
         }
-        
+
         const farmerOrders = await pool.query(`
             SELECT 
                 o.id,
@@ -111,7 +113,7 @@ router.get('/farmer-orders', async (req, res) => {
             WHERE f.owner_id = $1
             ORDER BY o.created_at DESC
         `, [targetFarmerId]);
-        
+
         res.json(farmerOrders.rows);
     } catch (err) {
         console.error(err.message);
@@ -189,11 +191,109 @@ router.put('/:id/status', async (req, res) => {
             return res.status(403).json({ error: 'Only the field owner or admin can update order status' });
         }
 
-        const result = await pool.query(
-            'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
-            [status, id]
+        // Get full order details for coin operations
+        const orderFullResult = await pool.query(
+            `SELECT o.*, f.owner_id as farmer_id, f.name as field_name, u.preferred_currency 
+             FROM orders o 
+             JOIN fields f ON o.field_id = f.id 
+             JOIN users u ON o.buyer_id = u.id
+             WHERE o.id = $1`,
+            [id]
         );
-        res.json(result.rows[0]);
+        const order = orderFullResult.rows[0];
+        const oldStatus = order.status;
+
+        // Atomic update with coin logic
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // 1. Accepted: pending -> active (Credit Farmer)
+            if (oldStatus === 'pending' && status === 'active') {
+                const coinAmount = await coinService.calculateCoinCost(order.total_price, order.preferred_currency || 'USD');
+
+                await coinService.creditCoins(order.farmer_id, coinAmount, {
+                    reason: `Order Accepted: ${order.quantity}m² of ${order.field_name}`,
+                    refType: 'order',
+                    refId: order.id
+                });
+
+                // Notification for buyer
+                await client.query(
+                    'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+                    [order.buyer_id, `Your order for ${order.field_name} has been accepted by the farmer!`, 'success']
+                );
+            }
+
+            // 2. Rejected/Cancelled: pending -> cancelled (Refund Buyer)
+            if (oldStatus === 'pending' && status === 'cancelled') {
+                const coinAmount = await coinService.calculateCoinCost(order.total_price, order.preferred_currency || 'USD');
+
+                await coinService.refundCoins(order.buyer_id, coinAmount, {
+                    reason: `Order Rejected/Cancelled: ${order.field_name}`,
+                    refType: 'order',
+                    refId: order.id
+                });
+
+                // Notification for buyer
+                await client.query(
+                    'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+                    [order.buyer_id, `Your order for ${order.field_name} was cancelled/rejected. Coins have been refunded.`, 'info']
+                );
+            }
+
+            // 3. Reversal: active/completed -> cancelled (Deduct from Farmer, Refund Buyer)
+            if ((oldStatus === 'active' || oldStatus === 'completed') && status === 'cancelled') {
+                const coinAmount = await coinService.calculateCoinCost(order.total_price, order.preferred_currency || 'USD');
+
+                // Deduct from farmer first
+                try {
+                    await coinService.deductCoins(order.farmer_id, coinAmount, {
+                        reason: `Order Cancelled (Reversal): ${order.field_name}`,
+                        refType: 'order',
+                        refId: order.id
+                    });
+                } catch (deductErr) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({
+                        error: 'Cancellation failed: Insufficient coins in farmer wallet to process refund.',
+                        details: deductErr.message
+                    });
+                }
+
+                // Refund the buyer
+                await coinService.refundCoins(order.buyer_id, coinAmount, {
+                    reason: `Order Cancelled after acceptance: ${order.field_name}`,
+                    refType: 'order',
+                    refId: order.id
+                });
+
+                // Notifications
+                await client.query(
+                    'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+                    [order.farmer_id, `Order for ${order.field_name} was cancelled. Coins were deducted and returned to buyer.`, 'warning']
+                );
+
+                await client.query(
+                    'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+                    [order.buyer_id, `Your order for ${order.field_name} was cancelled. Coins have been refunded to your wallet.`, 'info']
+                );
+            }
+
+            // Update order status
+            const result = await client.query(
+                'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
+                [status, id]
+            );
+
+            await client.query('COMMIT');
+            res.json(result.rows[0]);
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -204,11 +304,11 @@ router.put('/:id/status', async (req, res) => {
 router.get('/my-orders', async (req, res) => {
     try {
         const user = req.user; // From attachUser middleware
-        
+
         if (!user) {
             return res.status(401).json({ error: 'Authentication required' });
         }
-        
+
         // Buyer sees their orders
         if (user.user_type === 'buyer') {
             const buyerOrders = await pool.query(`
@@ -240,7 +340,7 @@ router.get('/my-orders', async (req, res) => {
             `, [user.id]);
             return res.json(buyerOrders.rows);
         }
-        
+
         // For other roles, return empty or use appropriate endpoint
         res.json([]);
     } catch (err) {
@@ -254,12 +354,12 @@ router.get('/buyer/:buyerId', async (req, res) => {
     try {
         const { buyerId } = req.params;
         const user = req.user; // From attachUser middleware
-        
+
         // Check authorization: buyer can only see their own orders, admin can see any
         if (user && user.user_type !== 'admin' && user.id !== buyerId) {
             return res.status(403).json({ error: 'Access denied' });
         }
-        
+
         const buyerOrders = await pool.query(`
             SELECT 
                 o.id,
@@ -287,7 +387,7 @@ router.get('/buyer/:buyerId', async (req, res) => {
             WHERE o.buyer_id = $1
             ORDER BY o.created_at DESC
         `, [buyerId]);
-        
+
         res.json(buyerOrders.rows);
     } catch (err) {
         console.error(err.message);
@@ -312,46 +412,77 @@ router.get('/:id', async (req, res) => {
 
 // Create a new order
 router.post('/', async (req, res) => {
+    const client = await pool.connect();
     try {
+        await client.query('BEGIN');
+
         console.log('Creating order with data:', req.body);
         const { buyer_id, field_id, quantity, total_price, status = 'pending', selected_harvest_date, selected_harvest_label, mode_of_shipping } = req.body;
-        console.log('Extracted values:', { buyer_id, field_id, quantity, total_price, status, selected_harvest_date, selected_harvest_label });
-        
-        // Now using field_id directly since we dropped the products table
-        const newOrder = await pool.query(
-            'INSERT INTO orders (buyer_id, field_id, quantity, total_price, status, selected_harvest_date, selected_harvest_label, mode_of_shipping) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-            [buyer_id, field_id, quantity, total_price, status, selected_harvest_date, selected_harvest_label, mode_of_shipping]
-        );
-        console.log('Order created successfully:', newOrder.rows[0]);
-        
-        // Create notifications for both buyer and farmer
-        // Get field information for notifications
-        const fieldResult = await pool.query(
+
+        // 1. Get user preferences and field info
+        const userResult = await client.query('SELECT preferred_currency FROM users WHERE id = $1', [buyer_id]);
+        const userCurrency = userResult.rows[0]?.preferred_currency || 'USD';
+
+        const fieldResult = await client.query(
             'SELECT name as field_name, owner_id as farmer_id FROM fields WHERE id = $1',
             [field_id]
         );
-        
-        if (fieldResult.rows.length > 0) {
-            const { field_name, farmer_id } = fieldResult.rows[0];
-            
-            // Notification for buyer
-            await pool.query(
-                'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
-                [buyer_id, `Order placed successfully for ${field_name}`, 'success']
-            );
-            
-            // Notification for farmer
-            await pool.query(
-                'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
-                [farmer_id, `New order received for ${field_name}`, 'info']
-            );
+
+        if (fieldResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Field not found' });
         }
-        
+
+        const { field_name, farmer_id } = fieldResult.rows[0];
+
+        // 2. Prevent purchasing from own farm
+        if (buyer_id === farmer_id) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You cannot purchase from your own farm' });
+        }
+
+        // 3. Deduct coins from buyer
+        const coinAmount = await coinService.calculateCoinCost(total_price, userCurrency);
+
+        // Use a sub-transaction logic or just call service and catch
+        try {
+            await coinService.deductCoins(buyer_id, coinAmount, {
+                reason: `Order: ${quantity}m² of ${field_name}`,
+                refType: 'order',
+                refId: null // We'll update this if possible or just rely on the link in orders
+            });
+        } catch (coinErr) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: coinErr.message });
+        }
+
+        // 4. Insert order
+        const newOrder = await client.query(
+            'INSERT INTO orders (buyer_id, field_id, quantity, total_price, status, selected_harvest_date, selected_harvest_label, mode_of_shipping) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+            [buyer_id, field_id, quantity, total_price, status, selected_harvest_date, selected_harvest_label, mode_of_shipping]
+        );
+
+        const orderId = newOrder.rows[0].id;
+
+        // 5. Create notifications
+        await client.query(
+            'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+            [buyer_id, `Order placed successfully for ${field_name}. ${coinAmount} coins deducted.`, 'success']
+        );
+
+        await client.query(
+            'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+            [farmer_id, `New order received for ${field_name}. Accept it to receive your share!`, 'info']
+        );
+
+        await client.query('COMMIT');
         res.json(newOrder.rows[0]);
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Error creating order:', err.message);
-        console.error('Full error:', err);
-        res.status(500).send('Server Error');
+        res.status(500).json({ error: 'Server Error', details: err.message });
+    } finally {
+        client.release();
     }
 });
 

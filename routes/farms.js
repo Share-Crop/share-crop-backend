@@ -44,27 +44,35 @@ router.get('/:id', async (req, res) => {
 // Create a new farm
 router.post('/', async (req, res) => {
     try {
-        const { name, location, owner_id, farmIcon, coordinates, webcamUrl, description } = req.body;
-        
+        const {
+            name, location, owner_id, farmIcon, coordinates, webcamUrl, description,
+            status, cropType, irrigationType, soilType, area, monthlyRevenue, progress,
+            plantingDate, harvestDate, image, areaValue, areaUnit
+        } = req.body;
+
         // Debug logging
         console.log('Farm creation request body:', req.body);
-        console.log('Extracted farmIcon value:', farmIcon);
-        console.log('farmIcon type:', typeof farmIcon);
-        console.log('Coordinates received:', coordinates);
-        
+
         // Properly stringify coordinates for JSONB storage
         const coordinatesJson = coordinates ? JSON.stringify(coordinates) : null;
-        
+
         const newFarm = await pool.query(
-            "INSERT INTO farms (farm_name, location, owner_id, farm_icon, coordinates, webcam_url, description) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
-            [name, location, owner_id, farmIcon, coordinatesJson, webcamUrl, description]
+            `INSERT INTO farms (
+                farm_name, location, owner_id, farm_icon, coordinates, webcam_url, description,
+                status, crop_type, irrigation_type, soil_type, area, monthly_revenue, progress,
+                planting_date, harvest_date, image, area_value, area_unit
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING *`,
+            [
+                name, location, owner_id, farmIcon, coordinatesJson, webcamUrl, description,
+                status || 'Active', cropType, irrigationType, soilType, area, monthlyRevenue || 0, progress || 0,
+                plantingDate, harvestDate, image, areaValue, areaUnit || 'acres'
+            ]
         );
-        
+
         console.log('Created farm:', newFarm.rows[0]);
         res.json(newFarm.rows[0]);
     } catch (err) {
         console.error('Error creating farm:', err.message);
-        console.error('Error details:', err);
         res.status(500).json({ error: 'Server Error', details: err.message });
     }
 });
@@ -74,8 +82,17 @@ function mapFarmBodyToRow(body) {
     const out = {};
     if (!body || typeof body !== 'object') return out;
     if (body.farmName !== undefined) out.farm_name = body.farmName;
+    if (body.name !== undefined) out.farm_name = body.name;
     if (body.farmIcon !== undefined) out.farm_icon = body.farmIcon;
     if (body.webcamUrl !== undefined) out.webcam_url = body.webcamUrl;
+    if (body.cropType !== undefined) out.crop_type = body.cropType;
+    if (body.irrigationType !== undefined) out.irrigation_type = body.irrigationType;
+    if (body.soilType !== undefined) out.soil_type = body.soilType;
+    if (body.monthlyRevenue !== undefined) out.monthly_revenue = body.monthlyRevenue;
+    if (body.plantingDate !== undefined) out.planting_date = body.plantingDate;
+    if (body.harvestDate !== undefined) out.harvest_date = body.harvestDate;
+    if (body.areaValue !== undefined) out.area_value = body.areaValue;
+    if (body.areaUnit !== undefined) out.area_unit = body.areaUnit;
     return out;
 }
 
@@ -87,24 +104,47 @@ router.put('/:id', async (req, res) => {
         if (existing.rows.length === 0) {
             return res.status(404).json({ msg: 'Farm not found' });
         }
-        const mapped = mapFarmBodyToRow(req.body);
-        const row = { ...existing.rows[0], ...mapped, ...req.body };
+
         const existingRow = existing.rows[0];
+        const mapped = mapFarmBodyToRow(req.body);
+        const row = { ...existingRow, ...mapped, ...req.body };
 
-        // Use existing values when merged value is null/undefined so we never violate NOT NULL
-        const name = (row.farm_name ?? row.name) ?? (existingRow.farm_name ?? existingRow.name);
-        const location = row.location ?? existingRow.location;
-        const owner_id = row.owner_id ?? existingRow.owner_id;
-        const farmIcon = (row.farm_icon ?? row.farmIcon) ?? (existingRow.farm_icon ?? existingRow.farmIcon);
-        const coordinates = row.coordinates ?? existingRow.coordinates;
-        const webcamUrl = (row.webcam_url ?? row.webcamUrl) ?? (existingRow.webcam_url ?? existingRow.webcamUrl);
-        const description = row.description ?? existingRow.description;
+        // Ensure we use the right keys from the merged object
+        const name = row.farm_name || row.name;
+        const location = row.location;
+        const owner_id = row.owner_id;
+        const farmIcon = row.farm_icon || row.farmIcon;
+        const coordinates = row.coordinates;
+        const webcamUrl = row.webcam_url || row.webcamUrl;
+        const description = row.description;
+        const status = row.status;
+        const cropType = row.crop_type || row.cropType;
+        const irrigationType = row.irrigation_type || row.irrigationType;
+        const soilType = row.soil_type || row.soilType;
+        const area = row.area;
+        const monthlyRevenue = row.monthly_revenue || row.monthlyRevenue;
+        const progress = row.progress;
+        const plantingDate = row.planting_date || row.plantingDate;
+        const harvestDate = row.harvest_date || row.harvestDate;
+        const image = row.image;
+        const areaValue = row.area_value || row.areaValue;
+        const areaUnit = row.area_unit || row.areaUnit;
 
-        const coordinatesJson = coordinates ? JSON.stringify(coordinates) : null;
+        const coordinatesJson = coordinates ? (typeof coordinates === 'string' ? coordinates : JSON.stringify(coordinates)) : null;
 
         const updateFarm = await pool.query(
-            "UPDATE farms SET farm_name = $1, location = $2, owner_id = $3, farm_icon = $4, coordinates = $5, webcam_url = $6, description = $7 WHERE id = $8 RETURNING *",
-            [name, location, owner_id, farmIcon, coordinatesJson, webcamUrl, description, id]
+            `UPDATE farms SET 
+                farm_name = $1, location = $2, owner_id = $3, farm_icon = $4, coordinates = $5, 
+                webcam_url = $6, description = $7, status = $8, crop_type = $9, irrigation_type = $10, 
+                soil_type = $11, area = $12, monthly_revenue = $13, progress = $14, 
+                planting_date = $15, harvest_date = $16, image = $17, area_value = $18, area_unit = $19 
+            WHERE id = $20 RETURNING *`,
+            [
+                name, location, owner_id, farmIcon, coordinatesJson,
+                webcamUrl, description, status, cropType, irrigationType,
+                soilType, area, monthlyRevenue, progress,
+                plantingDate, harvestDate, image, areaValue, areaUnit, id
+            ]
         );
         res.json(updateFarm.rows[0]);
     } catch (err) {
