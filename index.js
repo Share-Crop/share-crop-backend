@@ -8,6 +8,7 @@ const authRoutes = require('./routes/auth'); // Import auth routes
 // const productsRoutes = require('./routes/products'); // Removed - using fields directly
 const notificationsRoutes = require('./routes/notifications'); // Import notifications routes
 const ordersRoutes = require('./routes/orders'); // Import orders routes
+const deliveriesRoutes = require('./routes/deliveries'); // Import deliveries routes
 const coinsRoutes = require('./routes/coins'); // Import coins routes
 const complaintsRoutes = require('./routes/complaints'); // Import complaints routes
 const transactionsRoutes = require('./routes/transactions'); // Import transactions routes
@@ -64,6 +65,7 @@ app.use('/api/auth', authRoutes); // Use auth routes
 // app.use('/api/products', productsRoutes); // Removed - using fields directly
 app.use('/api/notifications', notificationsRoutes); // Use notifications routes
 app.use('/api/orders', ordersRoutes); // Use orders routes
+app.use('/api/deliveries', deliveriesRoutes); // Use deliveries routes
 app.use('/api/coins', coinsRoutes); // Use coins routes
 app.use('/api/complaints', complaintsRoutes); // Use complaints routes
 app.use('/api/transactions', transactionsRoutes); // Use transactions routes

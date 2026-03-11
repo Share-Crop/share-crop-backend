@@ -37,18 +37,38 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Get all fields for map (discovery/browse/buy) - any authenticated user sees all
+// Get all fields for map (discovery/browse/buy) - any authenticated user sees all.
+// IMPORTANT: This endpoint is user-centric for ownership/rental flags:
+// - is_own_field: true only when the field's owner_id matches the current user
+// - is_rented_by_me: true only when there is an active rental for this user on that field
 router.get('/all', async (req, res) => {
-    try {
-        if (!req.user || !req.user.id) {
-            return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
-        }
-        const result = await pool.query('SELECT * FROM fields');
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+  try {
+    const user = req.user;
+    if (!user || !user.id) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
     }
+
+    const result = await pool.query(
+      `SELECT 
+         f.*,
+         (f.owner_id = $1) AS is_own_field,
+         EXISTS (
+           SELECT 1 
+           FROM rented_fields rf
+           WHERE rf.field_id = f.id
+             AND rf.renter_id = $1
+             AND COALESCE(rf.status, 'active') = 'active'
+             AND (rf.end_date IS NULL OR rf.end_date >= CURRENT_DATE)
+         ) AS is_rented_by_me
+       FROM fields f`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
 });
 
 // Get fields available for a farmer to rent (other owners' fields, available = true)
