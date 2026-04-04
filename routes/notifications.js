@@ -5,7 +5,7 @@ const pool = require('../db');
 // Get all notifications
 router.get('/', async (req, res) => {
     try {
-        const allNotifications = await pool.query('SELECT * FROM notifications');
+        const allNotifications = await pool.query('SELECT * FROM notifications ORDER BY created_at DESC');
         res.json(allNotifications.rows);
     } catch (err) {
         console.error(err.message);
@@ -46,15 +46,15 @@ router.patch('/:id/read', async (req, res) => {
     }
 });
 
-// Get a single notification by ID
-router.get('/:id', async (req, res) => {
+// Mark all as read for a user
+router.patch('/user/:userId/read-all', async (req, res) => {
     try {
-        const { id } = req.params;
-        const notification = await pool.query('SELECT * FROM notifications WHERE id = $1', [id]);
-        if (notification.rows.length === 0) {
-            return res.status(404).json('Notification not found');
-        }
-        res.json(notification.rows[0]);
+        const { userId } = req.params;
+        await pool.query(
+            'UPDATE notifications SET read = true WHERE user_id = $1',
+            [userId]
+        );
+        res.json({ message: 'All notifications marked as read' });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -76,25 +76,6 @@ router.post('/', async (req, res) => {
     }
 });
 
-// Update a notification
-router.put('/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { user_id, message, type, read } = req.body;
-        const updateNotification = await pool.query(
-            'UPDATE notifications SET user_id = $1, message = $2, type = $3, read = $4 WHERE id = $5 RETURNING *',
-            [user_id, message, type, read, id]
-        );
-        if (updateNotification.rows.length === 0) {
-            return res.status(404).json('Notification not found');
-        }
-        res.json(updateNotification.rows[0]);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-});
-
 // Delete a notification
 router.delete('/:id', async (req, res) => {
     try {
@@ -110,33 +91,12 @@ router.delete('/:id', async (req, res) => {
     }
 });
 
-// Get notifications for a specific user
-router.get('/user/:userId', async (req, res) => {
+// Delete all notifications for a user (Cleanup utility)
+router.delete('/user/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
-        const userNotifications = await pool.query(
-            'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC',
-            [userId]
-        );
-        res.json(userNotifications.rows);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-});
-
-// Mark notification as read
-router.patch('/:id/read', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const updateNotification = await pool.query(
-            'UPDATE notifications SET read = true WHERE id = $1 RETURNING *',
-            [id]
-        );
-        if (updateNotification.rows.length === 0) {
-            return res.status(404).json('Notification not found');
-        }
-        res.json(updateNotification.rows[0]);
+        const result = await pool.query('DELETE FROM notifications WHERE user_id = $1', [userId]);
+        res.json({ message: `${result.rowCount} notifications deleted` });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');

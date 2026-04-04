@@ -1,0 +1,46 @@
+{
+  "cr": [
+    {
+      "id": "3a2be3f3-70a0-4dc2-b04d-0b3b11877139",
+      "currency": "EUR",
+      "coins_per_unit": "1.00",
+      "display_name": "Euro",
+      "symbol": "€",
+      "is_active": true,
+      "created_by": null,
+      "updated_by": "b744a433-0e10-4c62-b555-54465ef1f2f1",
+      "created_at": "2026-02-11T16:19:03.245Z",
+      "updated_at": "2026-02-11T16:36:10.874Z"
+    },
+    {
+      "id": "88adf6df-e44a-4fdc-90eb-a64807f91397",
+      "currency": "USD",
+      "coins_per_unit": "1.00",
+      "display_name": "US Dollar",
+      "symbol": "$",
+      "is_active": true,
+      "created_by": null,
+      "updated_by": "b744a433-0e10-4c62-b555-54465ef1f2f1",
+      "created_at": "2026-02-11T16:19:03.245Z",
+      "updated_at": "2026-02-11T17:01:00.319Z"
+    }
+  ],
+  "cp": [
+    {
+      "id": "9a6141c1-ee2b-4b66-980f-94686373bbd8",
+      "name": "Starter Package",
+      "description": "Opening Discount",
+      "coins": 100,
+      "price": "10.00",
+      "currency": "USD",
+      "discount_percent": "10.00",
+      "display_order": 1,
+      "is_active": true,
+      "is_featured": true,
+      "created_by": "b744a433-0e10-4c62-b555-54465ef1f2f1",
+      "updated_by": "b744a433-0e10-4c62-b555-54465ef1f2f1",
+      "created_at": "2026-02-11T16:56:20.652Z",
+      "updated_at": "2026-02-11T16:56:20.652Z"
+    }
+  ]
+}

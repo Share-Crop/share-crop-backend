@@ -23,8 +23,13 @@ router.get('/my', async (req, res) => {
     }
 
     const userId = user.id;
+    console.log('Delivery API called with userId:', userId);
 
-    // 1. Deliveries where the user is the buyer
+    // Debug: Check if user has any orders
+    const debugOrders = await pool.query('SELECT id, buyer_id, field_id, status, mode_of_shipping FROM orders WHERE buyer_id = $1', [userId]);
+    console.log('Orders for userId:', userId, 'Result:', debugOrders.rows);
+
+    // 1. Deliveries where the user is the buyer (ALL orders regardless of shipping mode)
     const buyerResult = await pool.query(`
       SELECT 
         o.id,
@@ -47,11 +52,10 @@ router.get('/my', async (req, res) => {
       JOIN fields f ON o.field_id = f.id
       LEFT JOIN users farmer ON f.owner_id = farmer.id
       WHERE o.buyer_id = $1
-        AND LOWER(COALESCE(o.mode_of_shipping, '')) = 'delivery'
       ORDER BY COALESCE(o.selected_harvest_date, o.created_at) DESC
     `, [userId]);
 
-    // 2. Deliveries where the user is the farmer (orders on their fields)
+    // 2. Deliveries where the user is the farmer (ALL orders regardless of shipping mode)
     const farmerResult = await pool.query(`
       SELECT 
         o.id,
@@ -74,7 +78,6 @@ router.get('/my', async (req, res) => {
       JOIN fields f ON o.field_id = f.id
       LEFT JOIN users buyer ON o.buyer_id = buyer.id
       WHERE f.owner_id = $1
-        AND LOWER(COALESCE(o.mode_of_shipping, '')) = 'delivery'
       ORDER BY COALESCE(o.selected_harvest_date, o.created_at) DESC
     `, [userId]);
 

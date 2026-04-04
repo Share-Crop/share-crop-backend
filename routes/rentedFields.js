@@ -19,16 +19,41 @@ router.get('/my-rentals', async (req, res) => {
         if (!req.user || !req.user.id) {
             return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
         }
-        const result = await pool.query(
+
+        // Get rentals from rented_fields table (for farmers renting other farmers' fields)
+        const rentedResult = await pool.query(
             `SELECT rf.*, f.name AS field_name, f.location AS field_location, f.category, f.subcategory,
-                    f.price_per_m2, f.available_area, f.total_area, f.farmer_name AS owner_name
+                    f.price_per_m2, f.available_area, f.total_area, f.farmer_name AS owner_name,
+                    f.total_production, f.distribution_price, f.retail_price, f.app_fees, f.potential_income,
+                    f.production_rate, f.production_rate_unit, f.harvest_dates, f.shipping_option
              FROM rented_fields rf
              JOIN fields f ON f.id = rf.field_id
              WHERE rf.renter_id = $1
              ORDER BY rf.start_date DESC`,
             [req.user.id]
         );
-        res.json(result.rows);
+
+        // Also get buyer orders (for buyers who purchased field areas)
+        const ordersResult = await pool.query(
+            `SELECT 
+                o.id, o.quantity as area_rented, o.total_price as price, o.status, o.created_at as start_date,
+                o.selected_harvest_date, o.selected_harvest_label,
+                f.id as field_id, f.name AS field_name, f.location AS field_location, 
+                f.category, f.subcategory, f.price_per_m2, f.available_area, f.total_area,
+                f.total_production, f.distribution_price, f.retail_price, f.app_fees, f.potential_income,
+                f.production_rate, f.production_rate_unit, f.harvest_dates, f.shipping_option,
+                u.name AS owner_name
+             FROM orders o
+             JOIN fields f ON f.id = o.field_id
+             LEFT JOIN users u ON f.owner_id = u.id
+             WHERE o.buyer_id = $1 AND o.status IN ('pending', 'active', 'completed')
+             ORDER BY o.created_at DESC`,
+            [req.user.id]
+        );
+
+        // Combine both sources
+        const allRentals = [...rentedResult.rows, ...ordersResult.rows];
+        res.json(allRentals);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
