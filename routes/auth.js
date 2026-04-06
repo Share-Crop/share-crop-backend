@@ -101,8 +101,8 @@ router.post('/signup', async (req, res) => {
 
     // Create user (using PostgreSQL's gen_random_uuid())
     const result = await pool.query(
-      `INSERT INTO users (id, name, email, password, user_type, email_verified, is_active, created_at, profile_image_url, preferred_currency)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), $7, $8)
+      `INSERT INTO users (id, name, email, password, user_type, email_verified, is_active, created_at, profile_image_url, preferred_currency, coins)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW(), $7, $8, 0)
        RETURNING id, name, email, user_type, created_at, email_verified, is_active, profile_image_url, preferred_currency`,
       [
         name.trim(),

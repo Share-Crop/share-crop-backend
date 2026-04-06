@@ -7,6 +7,7 @@ const adminQAController = require('../controllers/adminQAController');
 const adminNotificationsController = require('../controllers/adminNotificationsController');
 const adminFinanceController = require('../controllers/adminFinanceController');
 const adminAuditController = require('../controllers/adminAuditController');
+const adminProductIconsController = require('../controllers/adminProductIconsController');
 
 const router = express.Router();
 
@@ -77,5 +78,10 @@ router.get('/currency-rates', adminPackageController.listCurrencyRates);
 router.post('/currency-rates', adminPackageController.upsertCurrencyRate);
 router.patch('/currency-rates/:currency', adminPackageController.upsertCurrencyRate);
 router.delete('/currency-rates/:currency', adminPackageController.deleteCurrencyRate);
+
+// Product / crop category icons (Supabase URL stored in DB; upload from admin UI)
+router.get('/product-category-icons', adminProductIconsController.list);
+router.put('/product-category-icons', adminProductIconsController.upsert);
+router.delete('/product-category-icons', adminProductIconsController.remove);
 
 module.exports = router;

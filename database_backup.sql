@@ -322,7 +322,7 @@ CREATE TABLE public.users (
     user_type text NOT NULL,
     name text NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
-    coins integer DEFAULT 12500,
+    coins integer DEFAULT 0,
     CONSTRAINT users_user_type_check CHECK ((user_type = ANY (ARRAY['farmer'::text, 'buyer'::text])))
 );
 

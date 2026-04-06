@@ -15,7 +15,9 @@
     "migrate:auth:check-detail": "node checkUserTypesDetailed.js",
     "create:admin": "node createAdminUser.js",
     "reset:password": "node resetUserPasswords.js",
-    "reset:default-passwords": "node resetDefaultPasswords.js"
+    "reset:default-passwords": "node resetDefaultPasswords.js",
+    "migrate:036-coins-default-zero": "node runMigration036CoinsDefault.js",
+    "migrate:037-product-category-icons": "node runMigration037ProductCategoryIcons.js"
   },
   "keywords": [],
   "author": "",
