@@ -5,6 +5,9 @@ const redemptionService = require('../src/modules/redemption/redemptionService')
 const packageService = require('../src/modules/coins/packageService');
 const authenticate = require('../src/middleware/auth/authenticate');
 
+/** 5% app fee on coin purchases (added in Stripe as its own line item). */
+const COIN_PURCHASE_APP_FEE_RATE = 0.05;
+
 // ============================================================================
 // SPECIFIC ROUTES (MUST be before /:userId route to avoid route conflicts)
 // ============================================================================
@@ -132,8 +135,11 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
             finalPrice = pack.discounted_price;
         }
         
-        const priceInCents = Math.round(finalPrice * 100);
-        
+        const subtotalCents = Math.round(Number(finalPrice) * 100);
+        const appFeeCents = Math.round(subtotalCents * COIN_PURCHASE_APP_FEE_RATE);
+        const appFee = appFeeCents / 100;
+        const totalChargedCents = subtotalCents + appFeeCents;
+
         // Get currency rate for description
         const coinsPerUnit = await packageService.getCoinsPerCurrencyUnit(currencyCode);
         const currencyRates = await packageService.getCurrencyRates();
@@ -154,16 +160,33 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
                     : `${pack.name} - ${pack.coins} Coins`)
                 : `${coins} Custom Coins`;
             
+            const feeProductName = `Sharecrop app fee (${Math.round(COIN_PURCHASE_APP_FEE_RATE * 100)}%)`;
+            const feeDescription =
+                'Platform fee on coin purchases. Listed separately from your coin pack for transparency.';
+
             session = await stripe.checkout.sessions.create({
                 payment_method_types: ['card'],
                 line_items: [
                     {
                         price_data: {
                             currency: currencyCode.toLowerCase(),
-                            unit_amount: priceInCents,
+                            unit_amount: subtotalCents,
                             product_data: {
                                 name: productName,
-                                description: pack?.description || conversionText,
+                                description:
+                                    (pack?.description ? `${pack.description} — ` : '') +
+                                    `${conversionText}. Subtotal before app fee.`,
+                            },
+                        },
+                        quantity: 1,
+                    },
+                    {
+                        price_data: {
+                            currency: currencyCode.toLowerCase(),
+                            unit_amount: appFeeCents,
+                            product_data: {
+                                name: feeProductName,
+                                description: feeDescription,
                             },
                         },
                         quantity: 1,
@@ -173,13 +196,17 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
                 success_url: (finalSuccess.includes('?') ? finalSuccess + '&' : finalSuccess + '?') + 'session_id={CHECKOUT_SESSION_ID}',
                 cancel_url: finalCancel,
                 client_reference_id: req.user.id,
-                metadata: { 
-                    user_id: req.user.id, 
+                metadata: {
+                    user_id: req.user.id,
                     package_id: pack?.id || null,
                     pack_id: pack?.id || null, // Legacy support
                     coins: String(coins),
                     currency: currencyCode,
-                    is_custom: pack ? 'false' : 'true'
+                    is_custom: pack ? 'false' : 'true',
+                    subtotal: String(finalPrice),
+                    app_fee: String(appFee),
+                    app_fee_percent: String(Math.round(COIN_PURCHASE_APP_FEE_RATE * 100)),
+                    total_charged: String(totalChargedCents / 100),
                 },
             });
         } catch (err) {
@@ -194,16 +221,18 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
             packageName: pack?.name || 'Custom Coins',
             coins: coins,
             amount: finalPrice,
+            appFee,
+            totalCharged: totalChargedCents / 100,
             currency: currencyCode,
             sessionId: session.id,
             isCustom: !pack
         });
         
         const insertResult = await pool.query(
-            `INSERT INTO coin_purchases (farmer_id, amount, coins_purchased, currency, payment_ref, status, package_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `INSERT INTO coin_purchases (farmer_id, amount, app_fee_amount, coins_purchased, currency, payment_ref, status, package_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id`,
-            [req.user.id, finalPrice, coins, currencyCode.toLowerCase(), session.id, 'pending', pack?.id || null]
+            [req.user.id, finalPrice, appFee, coins, currencyCode.toLowerCase(), session.id, 'pending', pack?.id || null]
         );
 
         if (insertResult.rows.length === 0) {

@@ -24,7 +24,7 @@ router.get('/my-rentals', async (req, res) => {
         const rentedResult = await pool.query(
             `SELECT rf.*, f.name AS field_name, f.location AS field_location, f.category, f.subcategory,
                     f.price_per_m2, f.available_area, f.total_area, f.farmer_name AS owner_name,
-                    f.total_production, f.distribution_price, f.retail_price, f.app_fees, f.potential_income,
+                    f.total_production, f.total_production_unit, f.distribution_price, f.retail_price, f.app_fees, f.potential_income,
                     f.production_rate, f.production_rate_unit, f.harvest_dates, f.shipping_option
              FROM rented_fields rf
              JOIN fields f ON f.id = rf.field_id
@@ -40,7 +40,7 @@ router.get('/my-rentals', async (req, res) => {
                 o.selected_harvest_date, o.selected_harvest_label,
                 f.id as field_id, f.name AS field_name, f.location AS field_location, 
                 f.category, f.subcategory, f.price_per_m2, f.available_area, f.total_area,
-                f.total_production, f.distribution_price, f.retail_price, f.app_fees, f.potential_income,
+                f.total_production, f.total_production_unit, f.distribution_price, f.retail_price, f.app_fees, f.potential_income,
                 f.production_rate, f.production_rate_unit, f.harvest_dates, f.shipping_option,
                 u.name AS owner_name
              FROM orders o

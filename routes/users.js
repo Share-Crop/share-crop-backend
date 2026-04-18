@@ -3,6 +3,110 @@ const router = express.Router();
 const pool = require('../db'); // Assuming db.js is in the parent directory
 const authenticate = require('../src/middleware/auth/authenticate');
 
+function formatDeliverySummary(row) {
+  if (row.formatted_summary && String(row.formatted_summary).trim()) return String(row.formatted_summary).trim();
+  const n = (row.recipient_name || '').trim();
+  const line = [row.line1, row.line2].filter(Boolean).join(' ').trim();
+  const mid = [row.city, row.state, row.zip].filter(Boolean).join(', ').trim();
+  const parts = [n, line, mid, row.country].filter(Boolean);
+  return parts.join(', ');
+}
+
+/** Current user's saved default delivery address (map / checkout). */
+router.get('/me/delivery-address', authenticate, async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const r = await pool.query(
+      `SELECT recipient_name, phone, line1, line2, city, state, zip, country, formatted_summary
+       FROM user_delivery_addresses WHERE user_id = $1`,
+      [uid]
+    );
+    if (!r.rows.length) return res.json(null);
+    const row = r.rows[0];
+    res.json({
+      name: row.recipient_name,
+      phone: row.phone,
+      line1: row.line1,
+      line2: row.line2 || '',
+      city: row.city,
+      state: row.state || '',
+      zip: row.zip || '',
+      country: row.country,
+      summary: formatDeliverySummary(row),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load delivery address' });
+  }
+});
+
+/** Upsert default delivery address for the current user. */
+router.put('/me/delivery-address', authenticate, async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const b = req.body || {};
+    const recipient_name = (b.name ?? b.recipient_name ?? '').trim() || null;
+    const phone = (b.phone ?? '').trim() || null;
+    const line1 = String(b.line1 ?? '').trim();
+    const line2 = (b.line2 ?? '').trim() || null;
+    const city = String(b.city ?? '').trim();
+    const state = (b.state ?? '').trim() || null;
+    const zip = (b.zip ?? '').trim() || null;
+    const country = String(b.country ?? '').trim();
+    const formatted_summary = (b.summary ?? b.formatted_summary ?? '').trim() || null;
+
+    if (!line1 || !city || !country) {
+      return res.status(400).json({ error: 'line1, city, and country are required' });
+    }
+
+    const rowForSummary = {
+      recipient_name,
+      line1,
+      line2,
+      city,
+      state,
+      zip,
+      country,
+      formatted_summary,
+    };
+    const summary = formatted_summary || formatDeliverySummary(rowForSummary);
+
+    const ins = await pool.query(
+      `INSERT INTO user_delivery_addresses (
+         user_id, recipient_name, phone, line1, line2, city, state, zip, country, formatted_summary, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+       ON CONFLICT (user_id) DO UPDATE SET
+         recipient_name = EXCLUDED.recipient_name,
+         phone = EXCLUDED.phone,
+         line1 = EXCLUDED.line1,
+         line2 = EXCLUDED.line2,
+         city = EXCLUDED.city,
+         state = EXCLUDED.state,
+         zip = EXCLUDED.zip,
+         country = EXCLUDED.country,
+         formatted_summary = EXCLUDED.formatted_summary,
+         updated_at = now()
+       RETURNING recipient_name, phone, line1, line2, city, state, zip, country, formatted_summary`,
+      [uid, recipient_name, phone, line1, line2, city, state, zip, country, summary]
+    );
+    const row = ins.rows[0];
+    res.json({
+      name: row.recipient_name,
+      phone: row.phone,
+      line1: row.line1,
+      line2: row.line2 || '',
+      city: row.city,
+      state: row.state || '',
+      zip: row.zip || '',
+      country: row.country,
+      summary: formatDeliverySummary(row),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save delivery address' });
+  }
+});
+
 // Get all users with enhanced stats
 router.get('/', async (req, res) => {
   try {

@@ -17,7 +17,9 @@
     "reset:password": "node resetUserPasswords.js",
     "reset:default-passwords": "node resetDefaultPasswords.js",
     "migrate:036-coins-default-zero": "node runMigration036CoinsDefault.js",
-    "migrate:037-product-category-icons": "node runMigration037ProductCategoryIcons.js"
+    "migrate:037-product-category-icons": "node runMigration037ProductCategoryIcons.js",
+    "migrate:042-order-refund-requests": "node runMigration042OrderRefundRequests.js",
+    "migrate:043-order-status-shipped": "node runMigration043OrderStatusShipped.js"
   },
   "keywords": [],
   "author": "",
