@@ -6,19 +6,26 @@ const pool = require('../db');
 router.get('/', async (req, res) => {
     try {
         const { owner_id } = req.query;
-        console.log('Farms API called with owner_id:', owner_id);
-        let query = "SELECT * FROM farms";
+        let query = 'SELECT * FROM farms';
         let values = [];
 
         if (owner_id) {
-            query += " WHERE owner_id = $1";
-            values.push(owner_id);
+            // Farms the user owns OR farms that contain at least one field owned by this user.
+            // (MyFarms lists fields by owner_id / name / created_by; without this UNION, a NULL/wrong
+            // farms.owner_id makes the farm disappear while owned fields still show.)
+            query = `
+                SELECT DISTINCT f.*
+                FROM farms f
+                WHERE f.owner_id::text = $1::text
+                UNION
+                SELECT DISTINCT f.*
+                FROM farms f
+                INNER JOIN fields fi ON fi.farm_id = f.id AND fi.owner_id::text = $1::text
+            `.trim();
+            values.push(String(owner_id).trim());
         }
 
-        console.log('Executing query:', query, 'with values:', values);
         const allFarms = await pool.query(query, values);
-        console.log('Found farms:', allFarms.rows.length);
-        console.log('Farms data:', allFarms.rows);
         res.json(allFarms.rows);
     } catch (err) {
         console.error(err.message);

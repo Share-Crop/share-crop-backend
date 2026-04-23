@@ -45,6 +45,7 @@ router.get('/my', async (req, res) => {
         f.location,
         f.category AS crop_type,
         f.image AS image_url,
+        f.estimated_delivery_days,
         f.owner_id AS farmer_id,
         farmer.name  AS farmer_name,
         farmer.email AS farmer_email
@@ -71,6 +72,7 @@ router.get('/my', async (req, res) => {
         f.location,
         f.category AS crop_type,
         f.image AS image_url,
+        f.estimated_delivery_days,
         f.owner_id AS farmer_id,
         buyer.name  AS buyer_name,
         buyer.email AS buyer_email

@@ -36,6 +36,124 @@ function parseEstimatedDeliveryDate(body) {
   return null;
 }
 
+const MAX_SHIPPING_DESTINATIONS = 100;
+
+function normalizeIso2(code) {
+  if (code == null || code === '') return '';
+  const s = String(code).trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(s) ? s : '';
+}
+
+/**
+ * Normalize shipping_destinations from API body to a JSON-serializable array.
+ * Items: { type: 'country'|'city', countryCode: 'DE', city?: 'Berlin', label?: '...' }
+ */
+function parseShippingDestinationsBody(body) {
+  if (!body || typeof body !== 'object') return [];
+  const raw = body.shipping_destinations ?? body.shippingDestinations;
+  if (raw == null || raw === '') return [];
+  let arr = raw;
+  if (typeof raw === 'string') {
+    try {
+      arr = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    if (!item || typeof item !== 'object') continue;
+    const type = String(item.type || '').toLowerCase();
+    const countryCode = normalizeIso2(item.countryCode ?? item.country_code);
+    const city = item.city != null ? String(item.city).trim().slice(0, 120) : '';
+    const label = item.label != null ? String(item.label).trim().slice(0, 200) : '';
+    if (type === 'country' && countryCode) {
+      const key = `c:${countryCode}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ type: 'country', countryCode, ...(label ? { label } : {}) });
+    } else if (type === 'city' && countryCode && city) {
+      const key = `t:${countryCode}:${city.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ type: 'city', countryCode, city, ...(label ? { label } : {}) });
+    }
+    if (out.length >= MAX_SHIPPING_DESTINATIONS) break;
+  }
+  return out;
+}
+
+/** Keep DB CHECK on shipping_scope satisfied; coarse summary for legacy filters. */
+function deriveShippingScopeFromDestinations(destinations, clientScope) {
+  const d = Array.isArray(destinations) ? destinations : [];
+  if (d.length === 0) {
+    const s = String(clientScope || 'Global').trim();
+    return ['City', 'Country', 'Global'].includes(s) ? s : 'Global';
+  }
+  const countryOnly = d.every((x) => x.type === 'country');
+  const cityOnly = d.every((x) => x.type === 'city');
+  if (countryOnly && d.length === 1) return 'Country';
+  if (cityOnly && d.length === 1) return 'City';
+  return 'Global';
+}
+
+/** Whole days until delivery (optional). Prefer over estimated_delivery_date when set. */
+function parseEstimatedDeliveryDays(body) {
+  if (!body || typeof body !== 'object') return null;
+  const raw =
+    body.estimated_delivery_days ??
+    body.estimatedDeliveryDays ??
+    body.deliveryDays ??
+    null;
+  if (raw == null || raw === '') return null;
+  const n = parseInt(String(raw).trim(), 10);
+  if (Number.isNaN(n) || n < 1) return null;
+  return Math.min(n, 366);
+}
+
+/** Clamp sell-percent to 0–100. */
+function clampSellPercent(raw) {
+  if (raw == null || raw === '') return null;
+  const n = parseFloat(raw);
+  if (Number.isNaN(n)) return null;
+  return Math.min(100, Math.max(0, n));
+}
+
+/**
+ * Derive fields.quantity (sellable amount, same unit as total_production) and quantity_sell_percent.
+ * Prefers explicit percent when total_production > 0; otherwise infers percent from legacy absolute quantity.
+ */
+function resolveQuantityAndSellPercent(body, existingRow = null) {
+  const totalProd = parseFloat(
+    body.total_production ?? body.totalProduction ?? existingRow?.total_production ?? ''
+  );
+  const hasTotal = Number.isFinite(totalProd) && totalProd > 0;
+
+  const pctExplicit =
+    body.quantity_sell_percent ?? body.quantitySellPercent ?? body.sellingAmountPercent ?? null;
+
+  let sellPercent = clampSellPercent(pctExplicit);
+  let qty =
+    body.quantity != null && body.quantity !== ''
+      ? parseFloat(body.quantity)
+      : body.sellingAmount != null && body.sellingAmount !== ''
+        ? parseFloat(body.sellingAmount)
+        : null;
+
+  if (sellPercent != null && hasTotal) {
+    qty = totalProd * (sellPercent / 100);
+  } else if (sellPercent == null && qty != null && !Number.isNaN(qty) && hasTotal) {
+    sellPercent = (qty / totalProd) * 100;
+  }
+
+  if (qty != null && Number.isNaN(qty)) qty = null;
+  if (sellPercent != null && Number.isNaN(sellPercent)) sellPercent = null;
+
+  return { quantity: qty, quantity_sell_percent: sellPercent };
+}
+
 // Get fields: admin gets all (or by owner_id); regular users get only their own (owner_id = user.id)
 router.get('/', async (req, res) => {
   try {
@@ -165,6 +283,7 @@ router.get('/public', async (req, res) => {
          f.shipping_pickup,
          f.shipping_delivery,
          f.shipping_scope,
+         f.shipping_destinations,
          f.delivery_charges,
          f.subcategory,
          f.available,
@@ -430,6 +549,7 @@ router.post('/', async (req, res) => {
       location,
       image,
       farm_id,
+      farmId,
       owner_id,
       field_size,
       field_size_unit,
@@ -482,6 +602,30 @@ router.post('/', async (req, res) => {
       delivery_time,
     } = req.body;
 
+    const resolvedFarmId = farm_id ?? farmId ?? null;
+    if (
+      resolvedFarmId == null ||
+      (typeof resolvedFarmId === 'string' && resolvedFarmId.trim() === '')
+    ) {
+      return res.status(400).json({
+        error: 'farm_id is required',
+        message:
+          'Every field must belong to a farm. Create a farm in My Farms, then create or edit the field and pick that farm.',
+      });
+    }
+    if (owner_id) {
+      const farmOwn = await pool.query(
+        'SELECT 1 FROM farms WHERE id = $1 AND owner_id = $2 LIMIT 1',
+        [resolvedFarmId, owner_id]
+      );
+      if (farmOwn.rows.length === 0) {
+        return res.status(400).json({
+          error: 'Invalid farm_id',
+          message: 'The selected farm must belong to the same owner as this field.',
+        });
+      }
+    }
+
     // Validation: if available_for_rent then require rent_price_per_month and at least one duration
     const availRent = available_for_rent === true || available_for_rent === 'true';
     if (availRent) {
@@ -507,11 +651,16 @@ router.post('/', async (req, res) => {
     const numericTotalArea = total_area ? parseFloat(total_area) : null;
     const numericPrice = price ? parseFloat(price) : null;
     const numericPricePerM2 = price_per_m2 ? parseFloat(price_per_m2) : null;
-    const numericQuantity = quantity ? parseFloat(quantity) : null;
+    const numericTotalProduction = total_production ? parseFloat(total_production) : null;
+    const sellResolved = resolveQuantityAndSellPercent(
+      { ...req.body, total_production: numericTotalProduction ?? total_production },
+      null
+    );
+    const numericQuantity = sellResolved.quantity;
+    const numericQuantitySellPercent = sellResolved.quantity_sell_percent;
     const numericRating = rating ? parseFloat(rating) : 0.0;
     const numericProductionRate = production_rate ? parseFloat(production_rate) : null;
     const numericDeliveryCharges = delivery_charges ? parseFloat(delivery_charges) : null;
-    const numericTotalProduction = total_production ? parseFloat(total_production) : null;
     const numericDistributionPrice = distribution_price ? parseFloat(distribution_price) : null;
     const numericRetailPrice = retail_price ? parseFloat(retail_price) : null;
     const numericVirtualProd = virtual_production_rate ? parseFloat(virtual_production_rate) : null;
@@ -562,12 +711,22 @@ router.post('/', async (req, res) => {
     }
 
     const shortDescVal = short_description != null ? short_description : shortDescription;
-    const estimatedDeliveryYmd = parseEstimatedDeliveryDate({
-      estimated_delivery_date,
-      estimatedDeliveryDate: req.body.estimatedDeliveryDate,
-      delivery_time,
-      deliveryTime,
-    });
+    const numericEstimatedDeliveryDays = parseEstimatedDeliveryDays(req.body);
+    const estimatedDeliveryYmdFinal =
+      numericEstimatedDeliveryDays != null
+        ? null
+        : parseEstimatedDeliveryDate({
+            estimated_delivery_date,
+            estimatedDeliveryDate: req.body.estimatedDeliveryDate,
+            delivery_time,
+            deliveryTime,
+          });
+
+    const shippingDestinationsArr = parseShippingDestinationsBody(req.body);
+    const shippingScopeForInsert = deriveShippingScopeFromDestinations(
+      shippingDestinationsArr,
+      shipping_scope ?? 'Global'
+    );
 
     const result = await pool.query(
       `INSERT INTO fields (
@@ -577,23 +736,27 @@ router.post('/', async (req, res) => {
         unit, quantity, farmer_name, available, rating, reviews, 
         production_rate, production_rate_unit, harvest_dates, shipping_option, delivery_charges,
         estimated_delivery_date,
+        estimated_delivery_days,
         available_for_buy, available_for_rent, rent_price_per_month, rent_duration_monthly, rent_duration_quarterly, rent_duration_yearly,
         total_production, total_production_unit, distribution_price, retail_price, virtual_production_rate, virtual_cost_per_unit, app_fees, potential_income, user_virtual_rent,
-        total_area_m2, available_area_m2, display_unit, shipping_scope, shipping_pickup, shipping_delivery
+        total_area_m2, available_area_m2, display_unit, shipping_destinations, shipping_scope, shipping_pickup, shipping_delivery,
+        quantity_sell_percent
 
         ) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57) 
        RETURNING *`,
       [
-        name, description, shortDescVal ?? null, coordinatesJson, location, image, farm_id, owner_id,
+        name, description, shortDescVal ?? null, coordinatesJson, location, image, resolvedFarmId, owner_id,
         numericFieldSize, field_size_unit, numericAreaM2, numericAvailableArea, numericTotalArea,
         weather, has_webcam, webcam_url, is_own_field, category, subcategory, numericPrice, numericPricePerM2,
         unit, numericQuantity, farmer_name, available, numericRating, reviews,
         numericProductionRate, productionRateUnitStored, harvestDatesJson, shipping_option, deliveryChargesJson,
-        estimatedDeliveryYmd,
+        estimatedDeliveryYmdFinal,
+        numericEstimatedDeliveryDays,
         availBuy, availRentVal, numericRentPrice, rentMonthly, rentQuarterly, rentYearly,
         numericTotalProduction, totalProdUnitNorm, numericDistributionPrice, numericRetailPrice, numericVirtualProd, numericVirtualCost, numericAppFees, numericPotentialIncome, numericUserRent
-        , numericTotalAreaM2, numericAvailableAreaM2, display_unit, shipping_scope, shipping_pickup, shipping_delivery
+        , numericTotalAreaM2, numericAvailableAreaM2, display_unit, JSON.stringify(shippingDestinationsArr), shippingScopeForInsert, shipping_pickup, shipping_delivery,
+        numericQuantitySellPercent
       ]
     );
 
@@ -625,13 +788,14 @@ function mapBodyToRow(body) {
   const map = {
     productName: 'name',
     shippingScope: 'shipping_scope',
+    shippingDestinations: 'shipping_destinations',
     harvestDates: 'harvest_dates',
     farmId: 'farm_id',
     fieldSize: 'field_size',
     fieldSizeUnit: 'field_size_unit',
     productionRate: 'production_rate',
     productionRateUnit: 'production_rate_unit',
-    sellingAmount: 'quantity',
+    quantitySellPercent: 'quantity_sell_percent',
     sellingPrice: 'price',
     deliveryCharges: 'delivery_charges',
     hasWebcam: 'has_webcam',
@@ -647,6 +811,8 @@ function mapBodyToRow(body) {
     potentialIncome: 'potential_income',
     userVirtualRent: 'user_virtual_rent',
     shortDescription: 'short_description',
+    estimatedDeliveryDays: 'estimated_delivery_days',
+    deliveryDays: 'estimated_delivery_days',
     deliveryTime: 'estimated_delivery_date',
     delivery_time: 'estimated_delivery_date',
     estimatedDeliveryDate: 'estimated_delivery_date',
@@ -716,7 +882,11 @@ router.put('/:id', async (req, res) => {
       virtual_cost_per_unit: _virtual_cost_per_unit,
       app_fees: _app_fees,
       potential_income: _potential_income,
-      user_virtual_rent: _user_virtual_rent
+      user_virtual_rent: _user_virtual_rent,
+      shipping_scope: _shipping_scope,
+      shipping_pickup: _shipping_pickup,
+      shipping_delivery: _shipping_delivery,
+      shipping_destinations: _shipping_destinations,
     } = row;
 
     const name = _name ?? existingRow.name;
@@ -767,6 +937,35 @@ router.put('/:id', async (req, res) => {
     const app_fees = _app_fees ?? existingRow.app_fees;
     const potential_income = _potential_income ?? existingRow.potential_income;
     const user_virtual_rent = _user_virtual_rent ?? existingRow.user_virtual_rent;
+    const shipping_scope_merged = _shipping_scope ?? existingRow.shipping_scope;
+
+    const sellResolvedPut = resolveQuantityAndSellPercent(
+      {
+        total_production,
+        quantity,
+        quantitySellPercent:
+          Object.prototype.hasOwnProperty.call(req.body, 'quantitySellPercent') ||
+          Object.prototype.hasOwnProperty.call(req.body, 'quantity_sell_percent')
+            ? (req.body.quantitySellPercent ?? req.body.quantity_sell_percent)
+            : existingRow.quantity_sell_percent,
+        sellingAmount: Object.prototype.hasOwnProperty.call(req.body, 'sellingAmount')
+          ? req.body.sellingAmount
+          : undefined,
+      },
+      existingRow
+    );
+    const quantityForUpdate =
+      sellResolvedPut.quantity != null && !Number.isNaN(sellResolvedPut.quantity)
+        ? sellResolvedPut.quantity
+        : quantity != null && quantity !== ''
+          ? parseFloat(quantity)
+          : parseFloat(existingRow.quantity);
+    const quantitySellPercentForUpdate = sellResolvedPut.quantity_sell_percent;
+
+    const deliveryDaysTouched =
+      Object.prototype.hasOwnProperty.call(req.body, 'estimated_delivery_days') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'estimatedDeliveryDays') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'deliveryDays');
 
     const deliveryDateTouched =
       Object.prototype.hasOwnProperty.call(req.body, 'deliveryTime') ||
@@ -774,12 +973,62 @@ router.put('/:id', async (req, res) => {
       Object.prototype.hasOwnProperty.call(req.body, 'estimated_delivery_date') ||
       Object.prototype.hasOwnProperty.call(req.body, 'estimatedDeliveryDate');
 
+    let estimated_delivery_days_val;
+    if (deliveryDaysTouched) {
+      estimated_delivery_days_val = parseEstimatedDeliveryDays(req.body);
+    } else {
+      estimated_delivery_days_val = existingRow.estimated_delivery_days ?? null;
+    }
+
     let estimated_delivery_date_val;
-    if (deliveryDateTouched) {
+    if (estimated_delivery_days_val != null) {
+      estimated_delivery_date_val = null;
+    } else if (deliveryDateTouched) {
       estimated_delivery_date_val = parseEstimatedDeliveryDate(req.body);
     } else {
       estimated_delivery_date_val = existingRow.estimated_delivery_date ?? null;
     }
+
+    const shippingDestTouched =
+      Object.prototype.hasOwnProperty.call(req.body, 'shipping_destinations') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'shippingDestinations');
+
+    let shipping_destinations_val;
+    if (shippingDestTouched) {
+      shipping_destinations_val = parseShippingDestinationsBody(req.body);
+    } else {
+      const ex = existingRow.shipping_destinations;
+      if (Array.isArray(ex)) shipping_destinations_val = ex;
+      else if (typeof ex === 'string') {
+        try {
+          shipping_destinations_val = JSON.parse(ex);
+        } catch {
+          shipping_destinations_val = [];
+        }
+      } else if (ex && typeof ex === 'object') shipping_destinations_val = ex;
+      else shipping_destinations_val = [];
+    }
+    if (!Array.isArray(shipping_destinations_val)) shipping_destinations_val = [];
+
+    const shipping_scope_touched =
+      Object.prototype.hasOwnProperty.call(req.body, 'shipping_scope') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'shippingScope');
+
+    let shipping_scope_val;
+    if (shippingDestTouched) {
+      shipping_scope_val = deriveShippingScopeFromDestinations(
+        shipping_destinations_val,
+        shipping_scope_merged ?? 'Global'
+      );
+    } else if (shipping_scope_touched) {
+      const s = String(shipping_scope_merged || 'Global').trim();
+      shipping_scope_val = ['City', 'Country', 'Global'].includes(s) ? s : 'Global';
+    } else {
+      shipping_scope_val = existingRow.shipping_scope ?? 'Global';
+    }
+
+    const shipping_pickup_val = bool(_shipping_pickup ?? existingRow.shipping_pickup);
+    const shipping_delivery_val = bool(_shipping_delivery ?? existingRow.shipping_delivery);
 
     const availRent = available_for_rent === true || available_for_rent === 'true';
     if (availRent) {
@@ -814,13 +1063,15 @@ router.put('/:id', async (req, res) => {
            total_production = $39, distribution_price = $40, retail_price = $41,
            virtual_production_rate = $42, virtual_cost_per_unit = $43, app_fees = $44,
            potential_income = $45, user_virtual_rent = $46,
-           estimated_delivery_date = $47, total_production_unit = $48
+           estimated_delivery_date = $47, estimated_delivery_days = $48, total_production_unit = $49,
+           quantity_sell_percent = $50,
+           shipping_scope = $51, shipping_pickup = $52, shipping_delivery = $53, shipping_destinations = $54::jsonb
        WHERE id = $38 
        RETURNING *`,
       [
         name, description, coordinatesJson, location, image, farm_id, field_size, field_size_unit,
         area_m2, available_area, total_area, weather, has_webcam, webcam_url, is_own_field,
-        category, subcategory, price, price_per_m2, unit, quantity, farmer_name, available, rating, reviews,
+        category, subcategory, price, price_per_m2, unit, quantityForUpdate, farmer_name, available, rating, reviews,
         production_rate, production_rate_unit_final, harvestDatesJson, shipping_option, delivery_charges, owner_id,
         available_for_buy !== false && available_for_buy !== 'false',
         availRent,
@@ -838,7 +1089,13 @@ router.put('/:id', async (req, res) => {
         potential_income ? parseFloat(potential_income) : null,
         user_virtual_rent ? parseFloat(user_virtual_rent) : null,
         estimated_delivery_date_val,
-        total_prod_unit_final
+        estimated_delivery_days_val,
+        total_prod_unit_final,
+        quantitySellPercentForUpdate,
+        shipping_scope_val,
+        shipping_pickup_val,
+        shipping_delivery_val,
+        JSON.stringify(shipping_destinations_val),
       ]
     );
 
