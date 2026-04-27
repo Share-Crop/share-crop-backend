@@ -278,9 +278,11 @@ async function approveRedemption(redemptionId, adminId, adminNotes) {
         });
 
         // Create transfer to connected account
+        const payoutCurrency = (redemption.currency || 'USD').toLowerCase();
+
         const transfer = await stripe.transfers.create({
           amount: redemption.payout_amount_cents,
-          currency: 'usd',
+          currency: payoutCurrency,
           destination: redemption.stripe_connect_account_id,
         });
 

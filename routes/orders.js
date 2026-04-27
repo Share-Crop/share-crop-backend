@@ -10,6 +10,26 @@ const pendingRefundReasonSql = `(SELECT r.reason FROM order_refund_requests r WH
 
 const ORDER_STATUSES = ['pending', 'active', 'shipped', 'completed', 'cancelled'];
 
+/** @returns {{ amount: number, unit: string, notes: string | null } | { error: string } | null} */
+function parseDeclaredHarvestFromBody(body) {
+    if (!body || typeof body !== 'object') return null;
+    const raw = body.declared_harvest ?? body.declaredHarvest;
+    const hasNested = raw && typeof raw === 'object';
+    const q = hasNested ? (raw.amount ?? raw.quantity) : (body.harvest_amount ?? body.harvestAmount);
+    if (q == null || String(q).trim() === '') return null;
+    const u = hasNested && raw.unit != null ? raw.unit : (body.harvest_unit ?? body.harvestUnit) ?? 'kg';
+    const notesRaw = hasNested && raw.notes != null ? raw.notes : body.harvest_notes ?? body.harvestNotes;
+    const num = parseFloat(String(q).replace(/,/g, ''));
+    if (Number.isNaN(num) || num <= 0) {
+        return { error: 'Harvest amount must be a positive number.' };
+    }
+    const unit = String(u || 'kg')
+        .trim()
+        .slice(0, 32) || 'kg';
+    const notes = notesRaw != null ? String(notesRaw).trim().slice(0, 500) : '';
+    return { amount: num, unit, notes: notes || null };
+}
+
 /** Enforce a sensible lifecycle; admins may bypass via caller. */
 function validateOrderStatusTransition(oldStatus, newStatus) {
     if (oldStatus === newStatus) return { ok: true };
@@ -255,6 +275,26 @@ router.put('/:id/status', async (req, res) => {
             });
         }
 
+        const isAdmin = user && user.user_type === 'admin';
+        let harvestDataToSave = null;
+        if (status === 'completed' && oldStatus !== 'completed') {
+            const parsed = parseDeclaredHarvestFromBody(req.body);
+            if (parsed && parsed.error) {
+                return res.status(400).json({ error: parsed.error });
+            }
+            if (!isAdmin) {
+                if (parsed == null) {
+                    return res.status(400).json({
+                        error:
+                            'To mark an order completed, report how much you actually harvested (amount and unit, e.g. 1200 kg). This is saved as harvest history for the field.',
+                    });
+                }
+                harvestDataToSave = parsed;
+            } else if (parsed && !parsed.error) {
+                harvestDataToSave = parsed;
+            }
+        }
+
         // Atomic update with coin logic
         const client = await pool.connect();
         try {
@@ -299,6 +339,18 @@ router.put('/:id/status', async (req, res) => {
                 );
             }
 
+            // Active → Completed (optional path)
+            if (oldStatus === 'active' && status === 'completed') {
+                await client.query(
+                    'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+                    [
+                        order.buyer_id,
+                        `Your order for ${order.field_name} is now completed. Thank you for your purchase!`,
+                        'success',
+                    ]
+                );
+            }
+
             // Shipped → Completed
             if (oldStatus === 'shipped' && status === 'completed') {
                 await client.query(
@@ -309,6 +361,30 @@ router.put('/:id/status', async (req, res) => {
                         'success',
                     ]
                 );
+            }
+
+            if (status === 'completed' && oldStatus !== 'completed' && harvestDataToSave) {
+                const fieldInfo = await client.query(
+                    'SELECT id, farm_id, owner_id FROM fields WHERE id = $1',
+                    [order.field_id]
+                );
+                if (fieldInfo.rows.length) {
+                    const f = fieldInfo.rows[0];
+                    await client.query(
+                        `INSERT INTO field_harvest_declarations
+                          (field_id, farm_id, order_id, farmer_id, quantity, unit, notes)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                        [
+                            f.id,
+                            f.farm_id || null,
+                            id,
+                            f.owner_id,
+                            harvestDataToSave.amount,
+                            harvestDataToSave.unit,
+                            harvestDataToSave.notes,
+                        ]
+                    );
+                }
             }
 
             // 3. Reversal: active/shipped/completed -> cancelled (Deduct from Farmer, Refund Buyer)

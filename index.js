@@ -129,8 +129,7 @@ app.get('/api/health', async (req, res) => {
       stripe: {
         configured: !!stripeSecret,
         webhookConfigured: !!webhookSecret,
-        secretKeyPrefix: stripeSecret ? stripeSecret.substring(0, 7) + '...' : null
-      }
+      },
     });
   } catch (error) {
     console.error('Database health check failed:', error);
@@ -142,11 +141,24 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// Stripe configuration check endpoint
+// Stripe configuration check (do not expose in production without auth)
 app.get('/api/stripe/check', (req, res) => {
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    if (bearer !== cronSecret) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  } else if (process.env.NODE_ENV === 'production') {
+    return res.status(503).json({
+      error: 'Diagnostic disabled',
+      message: 'Set CRON_SECRET and call with Authorization: Bearer <CRON_SECRET> to use /api/stripe/check in production.',
+    });
+  }
+
   const stripeSecret = process.env.STRIPE_SECRET_KEY;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  
+
   if (!stripeSecret) {
     return res.status(503).json({
       configured: false,
@@ -172,15 +184,14 @@ app.get('/api/stripe/check', (req, res) => {
       configured: true,
       stripe: {
         secretKeySet: true,
-        secretKeyPrefix: stripeSecret.substring(0, 7) + '...',
         isTestKey: stripeSecret.startsWith('sk_test_'),
-        isLiveKey: stripeSecret.startsWith('sk_live_')
+        isLiveKey: stripeSecret.startsWith('sk_live_'),
       },
       webhook: {
         secretSet: true,
-        secretPrefix: webhookSecret.substring(0, 7) + '...'
       },
-      message: 'Stripe is configured. Purchase intent endpoint: POST /api/coins/purchase-intent (requires auth)'
+      message:
+        'Stripe is configured. Purchase intent: POST /api/coins/purchase-intent (requires auth). Key prefixes are not returned.',
     });
   } catch (err) {
     res.status(500).json({

@@ -30,32 +30,57 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
 
         const session = event.data.object;
         const sessionId = session.id;
-        
+
         console.log('[Webhook] Processing checkout.session.completed for session:', sessionId);
 
+        if (session.payment_status !== 'paid') {
+            console.warn('[Webhook] Ignoring session (not paid):', sessionId, session.payment_status);
+            return res.json({ received: true, skipped: 'not_paid' });
+        }
+
         // Idempotent: check if we already processed this session
-        // Use existing schema: payment_ref (to match what purchase-intent creates)
         const existingResult = await pool.query(
-            'SELECT id, status, farmer_id as user_id, coins_purchased as coins_granted FROM coin_purchases WHERE payment_ref = $1',
+            `SELECT id, status, farmer_id as user_id, coins_purchased as coins_granted,
+                    amount, app_fee_amount, currency
+             FROM coin_purchases WHERE payment_ref = $1`,
             [sessionId]
         );
-        
-        console.log('[Webhook] Found purchase record:', existingResult.rows.length > 0 ? JSON.stringify(existingResult.rows[0], null, 2) : 'none');
 
         if (existingResult.rows.length === 0) {
             console.error('[Webhook] coin_purchase not found for session:', sessionId);
-            // Log all recent purchases for debugging
-            const recentPurchases = await pool.query(
-                'SELECT id, farmer_id, payment_ref, status, created_at FROM coin_purchases ORDER BY created_at DESC LIMIT 5'
-            );
-            console.error('[Webhook] Recent purchases:', JSON.stringify(recentPurchases.rows, null, 2));
-            return res.status(400).send('Purchase record not found');
+            return res.json({ received: true, skipped: 'purchase_not_found' });
         }
 
         const existing = existingResult.rows[0];
 
         if (existing.status === 'completed') {
             return res.json({ received: true, already_processed: true });
+        }
+
+        const refUser = session.client_reference_id || session.metadata?.user_id;
+        if (!refUser || String(refUser) !== String(existing.user_id)) {
+            console.error('[Webhook] client_reference_id / metadata mismatch for session:', sessionId);
+            return res.json({ received: true, skipped: 'user_mismatch' });
+        }
+
+        const subtotalCents = Math.round(Number(existing.amount) * 100);
+        const feeCents = Math.round(Number(existing.app_fee_amount || 0) * 100);
+        const expectedTotalCents = subtotalCents + feeCents;
+        const paidCents = session.amount_total;
+        const sessionCurrency = (session.currency || '').toLowerCase();
+        const purchaseCurrency = (existing.currency || '').toLowerCase();
+
+        if (typeof paidCents !== 'number' || Math.abs(paidCents - expectedTotalCents) > 1) {
+            console.error('[Webhook] amount_total mismatch', {
+                sessionId,
+                paidCents,
+                expectedTotalCents,
+            });
+            return res.json({ received: true, skipped: 'amount_mismatch' });
+        }
+        if (sessionCurrency && purchaseCurrency && sessionCurrency !== purchaseCurrency) {
+            console.error('[Webhook] currency mismatch', { sessionId, sessionCurrency, purchaseCurrency });
+            return res.json({ received: true, skipped: 'currency_mismatch' });
         }
 
         const userId = existing.user_id;

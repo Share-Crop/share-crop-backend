@@ -516,6 +516,41 @@ router.put('/:id/short-description', async (req, res) => {
   }
 });
 
+// Harvest declarations for this field (farmer: own field, admin: any)
+router.get('/:id/harvest-declarations', async (req, res) => {
+  try {
+    const { id: fieldId } = req.params;
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    const field = await pool.query('SELECT id, owner_id, farm_id FROM fields WHERE id = $1', [fieldId]);
+    if (!field.rows.length) {
+      return res.status(404).json({ error: 'Field not found' });
+    }
+    const { owner_id: ownerId } = field.rows[0];
+    const isAdmin = String(user.user_type || '').toLowerCase() === 'admin';
+    if (!isAdmin && String(ownerId) !== String(user.id)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    const { rows } = await pool.query(
+      `SELECT h.id, h.quantity, h.unit, h.notes, h.order_id, h.created_at
+       FROM field_harvest_declarations h
+       WHERE h.field_id = $1
+       ORDER BY h.created_at DESC
+       LIMIT 200`,
+      [fieldId]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error(err);
+    if (err.code === '42P01') {
+      return res.status(500).json({ error: 'Harvest history is not available yet (run database migrations).' });
+    }
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Get a single field by ID
 router.get('/:id', async (req, res) => {
   try {

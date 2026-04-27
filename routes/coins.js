@@ -4,9 +4,13 @@ const pool = require('../db');
 const redemptionService = require('../src/modules/redemption/redemptionService');
 const packageService = require('../src/modules/coins/packageService');
 const authenticate = require('../src/middleware/auth/authenticate');
+const { resolveValidatedCheckoutUrls } = require('../src/utils/stripeCheckoutUrlAllowlist');
 
 /** 5% app fee on coin purchases (added in Stripe as its own line item). */
 const COIN_PURCHASE_APP_FEE_RATE = 0.05;
+
+/** Must stay aligned with frontend `MAX_CUSTOM_COINS_PURCHASE`. */
+const MAX_CUSTOM_COINS_PURCHASE = 1_000_000;
 
 // ============================================================================
 // SPECIFIC ROUTES (MUST be before /:userId route to avoid route conflicts)
@@ -83,14 +87,18 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
         const stripe = new Stripe(stripeSecret, { apiVersion: '2023-10-16' });
 
         const { pack_id, custom_coins, currency, success_url, cancel_url } = req.body || {};
-        
+
+        if (pack_id && (custom_coins !== undefined && custom_coins !== null && custom_coins !== '')) {
+            return res.status(400).json({ error: 'Provide either pack_id or custom_coins, not both' });
+        }
+
         let pack;
         let coins;
         let finalPrice;
         let currencyCode;
-        
+
         // Handle custom coin purchase
-        if (custom_coins && !pack_id) {
+        if (custom_coins !== undefined && custom_coins !== null && custom_coins !== '' && !pack_id) {
             // Use user's preferred currency if not specified
             let currencyToUse = currency;
             if (!currencyToUse) {
@@ -100,16 +108,22 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
                 );
                 currencyToUse = userResult.rows[0]?.preferred_currency || 'USD';
             }
-            
-            coins = parseInt(custom_coins);
-            if (isNaN(coins) || coins < 1) {
-                return res.status(400).json({ error: 'Invalid coin amount' });
+
+            const rawCoins = Number(custom_coins);
+            if (!Number.isInteger(rawCoins) || rawCoins < 1 || rawCoins > MAX_CUSTOM_COINS_PURCHASE) {
+                return res.status(400).json({
+                    error: `Invalid coin amount (use a whole number between 1 and ${MAX_CUSTOM_COINS_PURCHASE.toLocaleString()})`,
+                });
             }
-            
+            coins = rawCoins;
+
             // Get currency rate
             const coinsPerUnit = await packageService.getCoinsPerCurrencyUnit(currencyToUse);
+            if (!Number.isFinite(coinsPerUnit) || coinsPerUnit <= 0) {
+                return res.status(400).json({ error: 'Invalid currency conversion rate' });
+            }
             currencyCode = currencyToUse.toUpperCase();
-            
+
             // Calculate price: coins / coins_per_unit
             // e.g., if 1 USD = 1 coin, then 100 coins = $100
             finalPrice = coins / coinsPerUnit;
@@ -146,10 +160,17 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
         const rateInfo = currencyRates.find(r => r.currency === currencyCode);
         const currencySymbol = rateInfo?.symbol || currencyCode;
         const conversionText = `${coinsPerUnit} coins = ${currencySymbol}1.00`;
-        
-        // Default success/cancel URLs
-        const finalSuccess = success_url || process.env.SUCCESS_URL || 'http://localhost:3000/farmer/buy-coins?success=1';
-        const finalCancel = cancel_url || process.env.CANCEL_URL || 'http://localhost:3000/farmer/buy-coins?cancel=1';
+
+        let finalSuccess;
+        let finalCancel;
+        try {
+            const resolved = resolveValidatedCheckoutUrls(success_url, cancel_url);
+            finalSuccess = resolved.success;
+            finalCancel = resolved.cancel;
+        } catch (urlErr) {
+            console.error('[Purchase Intent] Checkout URL validation failed:', urlErr.message);
+            return res.status(400).json({ error: urlErr.message || 'Invalid checkout return URLs' });
+        }
 
         // Create Stripe Checkout Session
         let session;
