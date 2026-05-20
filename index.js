@@ -219,7 +219,12 @@ app.listen(port, () => {
     runPendingOrderExpiryJob().catch((err) => console.error('[expirePendingOrders]', err.message));
   };
 
-  if (disableBackgroundInterval) {
+  const autoAcceptOrders =
+    process.env.AUTO_ACCEPT_ORDERS !== '0' && process.env.AUTO_ACCEPT_ORDERS !== 'false';
+
+  if (autoAcceptOrders) {
+    console.log('[expirePendingOrders] skipped — AUTO_ACCEPT_ORDERS is enabled (orders confirm on create).');
+  } else if (disableBackgroundInterval) {
     const reason = onVercel ? 'Vercel serverless' : 'DISABLE_PENDING_ORDER_INTERVAL=1';
     console.log(
       `[expirePendingOrders] in-process timer off (${reason}). Use GET/POST /api/cron/expire-pending-orders with CRON_SECRET (e.g. Vercel Cron).`

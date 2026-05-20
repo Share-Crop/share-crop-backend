@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const { replaceFieldGalleryImages, attachGalleryToFieldRows } = require('./fieldHelpers');
+const {
+  completeFieldHarvest,
+  markFieldShipped,
+  listHarvestEventsForField,
+} = require('../src/modules/fields/fieldHarvestService');
 
 /** Canonical harvest yield unit (migration 042: total_production_unit). */
 function normalizeTotalProductionUnit(raw) {
@@ -546,6 +551,59 @@ router.get('/:id/harvest-declarations', async (req, res) => {
     console.error(err);
     if (err.code === '42P01') {
       return res.status(500).json({ error: 'Harvest history is not available yet (run database migrations).' });
+    }
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/** Field harvest workflow: declare total harvest → distribute to renters */
+router.post('/:id/complete-harvest', async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const isAdmin = String(user.user_type || '').toLowerCase() === 'admin';
+    const { total_quantity, totalQuantity, unit, notes } = req.body || {};
+    const result = await completeFieldHarvest(req.params.id, user.id, isAdmin, {
+      totalQuantity: total_quantity ?? totalQuantity,
+      unit,
+      notes,
+    });
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
+/** Mark field as shipped; syncs related orders to shipped */
+router.post('/:id/mark-shipped', async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const isAdmin = String(user.user_type || '').toLowerCase() === 'admin';
+    const result = await markFieldShipped(req.params.id, user.id, isAdmin);
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
+/** Harvest events + per-renter allocations for a field */
+router.get('/:id/harvest-events', async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const isAdmin = String(user.user_type || '').toLowerCase() === 'admin';
+    const result = await listHarvestEventsForField(req.params.id, user.id, isAdmin);
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    if (err.code === '42P01') {
+      return res.status(500).json({ error: 'Run migration 052_field_harvest_workflow.sql' });
     }
     return res.status(500).json({ error: 'Server error' });
   }

@@ -14,6 +14,10 @@ function getExpiryDays() {
  * Closes any pending buyer refund requests on those orders (table may not exist on old DBs).
  */
 async function runPendingOrderExpiryJob() {
+    // Orders are auto-accepted on create (AUTO_ACCEPT_ORDERS, default on). Legacy pending rows only.
+    if (process.env.AUTO_ACCEPT_ORDERS !== '0' && process.env.AUTO_ACCEPT_ORDERS !== 'false') {
+        return { processed: 0, days: getExpiryDays(), skipped: true, reason: 'auto_accept_enabled' };
+    }
     const days = getExpiryDays();
     const selectSql = `
         SELECT o.id, o.buyer_id, o.status, o.total_price, o.quantity, o.created_at,

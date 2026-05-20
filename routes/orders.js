@@ -4,6 +4,11 @@ const pool = require('../db');
 const coinService = require('../src/modules/coins/coinService');
 const { runOrderRefundCoinEffects } = require('../src/modules/orders/orderRefundEffects');
 const { canSetShippedOrCompletedByHarvest } = require('../src/modules/orders/harvestDateGate');
+const {
+    isAutoAcceptOrdersEnabled,
+    listAllocationsForBuyer,
+    orderHasHarvestAllocation,
+} = require('../src/modules/fields/fieldHarvestService');
 
 const pendingRefundIdSql = `(SELECT r.id FROM order_refund_requests r WHERE r.order_id = o.id AND r.status = 'pending' ORDER BY r.created_at DESC LIMIT 1)`;
 const pendingRefundReasonSql = `(SELECT r.reason FROM order_refund_requests r WHERE r.order_id = o.id AND r.status = 'pending' ORDER BY r.created_at DESC LIMIT 1)`;
@@ -282,11 +287,12 @@ router.put('/:id/status', async (req, res) => {
             if (parsed && parsed.error) {
                 return res.status(400).json({ error: parsed.error });
             }
-            if (!isAdmin) {
+            const hasFieldAllocation = await orderHasHarvestAllocation(id);
+            if (!isAdmin && !hasFieldAllocation) {
                 if (parsed == null) {
                     return res.status(400).json({
                         error:
-                            'To mark an order completed, report how much you actually harvested (amount and unit, e.g. 1200 kg). This is saved as harvest history for the field.',
+                            'Declare harvest for the whole field in My Farms (total quantity), or report harvest on this order (amount and unit, e.g. 1200 kg).',
                     });
                 }
                 harvestDataToSave = parsed;
@@ -431,6 +437,26 @@ router.put('/:id/status', async (req, res) => {
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
+    }
+});
+
+// Buyer: harvest allocations (actual kg + delta vs estimate) for resource bar
+router.get('/my-harvest-allocations', async (req, res) => {
+    try {
+        const user = req.user;
+        if (!user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+        const rows = await listAllocationsForBuyer(user.id);
+        return res.json(rows);
+    } catch (err) {
+        console.error(err);
+        if (err.code === '42P01') {
+            return res.status(500).json({
+                error: 'Harvest allocations not available (run migration 052_field_harvest_workflow.sql).',
+            });
+        }
+        return res.status(500).json({ error: 'Server error' });
     }
 });
 
@@ -817,7 +843,9 @@ router.post('/', async (req, res) => {
             mode_of_shipping,
             notes: notesRaw,
         } = req.body;
-        const insertStatus = 'pending';
+        const autoAccept = isAutoAcceptOrdersEnabled();
+        // Client: rent/purchase is automatically accepted (no farmer "pending" step).
+        const insertStatus = autoAccept ? 'active' : 'pending';
         const notes =
             notesRaw == null || notesRaw === ''
                 ? null
@@ -881,6 +909,22 @@ router.post('/', async (req, res) => {
 
         const orderId = newOrder.rows[0].id;
 
+        if (autoAccept) {
+            try {
+                await coinService.creditCoins(farmer_id, coinAmount, {
+                    reason: `Order confirmed: ${quantity}m² of ${field_name}`,
+                    refType: 'order',
+                    refId: orderId,
+                });
+            } catch (creditErr) {
+                await client.query('ROLLBACK');
+                return res.status(500).json({
+                    error: 'Order created but farmer payment failed. Please contact support.',
+                    details: creditErr.message,
+                });
+            }
+        }
+
         const deliverySnippet = (() => {
             if (!notes || String(mode_of_shipping || '').toLowerCase() !== 'delivery') return '';
             const m =
@@ -893,21 +937,41 @@ router.post('/', async (req, res) => {
             return raw.length > 220 ? `${raw.slice(0, 217)}…` : raw;
         })();
 
-        const farmerMessage =
-            deliverySnippet
-                ? `New order received for ${field_name}. Delivery to: ${deliverySnippet}`
-                : `New order received for ${field_name}. Accept it to receive your share!`;
+        const farmerMessage = autoAccept
+            ? deliverySnippet
+                ? `New order confirmed for ${field_name}. Delivery to: ${deliverySnippet}. Payment credited to your wallet.`
+                : `New order confirmed for ${field_name}. ${quantity}m² — payment credited to your wallet.`
+            : deliverySnippet
+              ? `New order received for ${field_name}. Delivery to: ${deliverySnippet}`
+              : `New order received for ${field_name}. Accept it to receive your share!`;
 
         // 5. Create notifications
         await client.query(
             'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
-            [buyer_id, `Order placed successfully for ${field_name}. ${coinAmount} coins deducted.`, 'success']
+            [
+                buyer_id,
+                autoAccept
+                    ? `Order confirmed for ${field_name}. ${coinAmount} coins deducted.`
+                    : `Order placed successfully for ${field_name}. ${coinAmount} coins deducted.`,
+                'success',
+            ]
         );
 
         await client.query(
             'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
             [farmer_id, farmerMessage, 'info']
         );
+
+        if (autoAccept) {
+            await client.query(
+                'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+                [
+                    buyer_id,
+                    `Your order for ${field_name} is confirmed and active.`,
+                    'success',
+                ]
+            );
+        }
 
         await client.query('COMMIT');
         res.json(newOrder.rows[0]);
