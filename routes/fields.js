@@ -104,6 +104,69 @@ function deriveShippingScopeFromDestinations(destinations, clientScope) {
   return 'Global';
 }
 
+/** Serialize API JSON/JSONB payloads for PostgreSQL (avoids "invalid input syntax for type json"). */
+function serializeJsonbParam(raw) {
+  if (raw == null || raw === '') return null;
+  let value = raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  return JSON.stringify(value);
+}
+
+/** Delivery tiers: [{ upto, amount }] stored as jsonb (legacy numeric single amount supported). */
+function serializeDeliveryChargesForDb(delivery_charges) {
+  if (delivery_charges == null || delivery_charges === '') return null;
+  if (typeof delivery_charges === 'number' && Number.isFinite(delivery_charges)) {
+    return JSON.stringify([{ upto: null, amount: delivery_charges }]);
+  }
+  if (typeof delivery_charges === 'string') {
+    const trimmed = delivery_charges.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return JSON.stringify(parsed);
+      const num = parseFloat(parsed);
+      if (!Number.isNaN(num)) return JSON.stringify([{ upto: null, amount: num }]);
+      return null;
+    } catch {
+      const num = parseFloat(delivery_charges);
+      if (!Number.isNaN(num)) return JSON.stringify([{ upto: null, amount: num }]);
+      return null;
+    }
+  }
+  if (Array.isArray(delivery_charges)) {
+    const tiers = delivery_charges
+      .filter((c) => c && c.amount != null && String(c.amount).trim() !== '')
+      .map((c) => ({
+        upto: c.upto != null && String(c.upto).trim() !== '' ? parseFloat(c.upto) : null,
+        amount: parseFloat(c.amount) || 0,
+      }));
+    return tiers.length > 0 ? JSON.stringify(tiers) : null;
+  }
+  const num = parseFloat(delivery_charges);
+  if (!Number.isNaN(num)) return JSON.stringify([{ upto: null, amount: num }]);
+  return null;
+}
+
+function fieldSizeToM2(fieldSize, fieldSizeUnit) {
+  const v = typeof fieldSize === 'string' ? parseFloat(fieldSize) : (fieldSize ?? 0);
+  if (!Number.isFinite(v)) return null;
+  const u = String(fieldSizeUnit || 'sqm').trim().toLowerCase();
+  if (u === 'acres' || u === 'acre') return v * 4046.8564224;
+  if (u === 'hectares' || u === 'hectare' || u === 'ha') return v * 10000;
+  if (u === 'sqft' || u === 'sq ft' || u === 'sq. ft' || u === 'ft2' || u === 'ft²' || u === 'square feet') {
+    return v * 0.092903;
+  }
+  return v;
+}
+
 /** Whole days until delivery (optional). Prefer over estimated_delivery_date when set. */
 function parseEstimatedDeliveryDays(body) {
   if (!body || typeof body !== 'object') return null;
@@ -734,14 +797,19 @@ router.post('/', async (req, res) => {
     }
 
     // Stringify JSON fields if they exist
-    const coordinatesJson = coordinates ? JSON.stringify(coordinates) : null;
-    const harvestDatesJson = harvest_dates ? JSON.stringify(harvest_dates) : null;
+    const coordinatesJson = serializeJsonbParam(coordinates);
+    const harvestDatesJson = serializeJsonbParam(harvest_dates);
 
     // Convert numeric fields to proper types
     const numericFieldSize = field_size ? parseFloat(field_size) : null;
-    const numericAreaM2 = area_m2 ? parseFloat(area_m2) : null;
-    const numericAvailableArea = available_area ? parseFloat(available_area) : null;
-    const numericTotalArea = total_area ? parseFloat(total_area) : null;
+    const computedAreaM2 = fieldSizeToM2(field_size, field_size_unit);
+    const numericAreaM2 = area_m2 != null && area_m2 !== '' ? parseFloat(area_m2) : computedAreaM2;
+    const numericAvailableArea = available_area != null && available_area !== ''
+      ? parseFloat(available_area)
+      : computedAreaM2;
+    const numericTotalArea = total_area != null && total_area !== ''
+      ? parseFloat(total_area)
+      : computedAreaM2;
     const numericPrice = price ? parseFloat(price) : null;
     const numericPricePerM2 = price_per_m2 ? parseFloat(price_per_m2) : null;
     const numericTotalProduction = total_production ? parseFloat(total_production) : null;
@@ -753,7 +821,6 @@ router.post('/', async (req, res) => {
     const numericQuantitySellPercent = sellResolved.quantity_sell_percent;
     const numericRating = rating ? parseFloat(rating) : 0.0;
     const numericProductionRate = production_rate ? parseFloat(production_rate) : null;
-    const numericDeliveryCharges = delivery_charges ? parseFloat(delivery_charges) : null;
     const numericDistributionPrice = distribution_price ? parseFloat(distribution_price) : null;
     const numericRetailPrice = retail_price ? parseFloat(retail_price) : null;
     const numericVirtualProd = virtual_production_rate ? parseFloat(virtual_production_rate) : null;
@@ -768,40 +835,14 @@ router.post('/', async (req, res) => {
     const rentMonthly = bool(rent_duration_monthly);
     const rentQuarterly = bool(rent_duration_quarterly);
     const rentYearly = bool(rent_duration_yearly);
-    const numericTotalAreaM2 = total_area_m2 ? parseFloat(total_area_m2) : null;
-    const numericAvailableAreaM2 = available_area_m2 ? parseFloat(available_area_m2) : null;
+    const numericTotalAreaM2 = total_area_m2 != null && total_area_m2 !== ''
+      ? parseFloat(total_area_m2)
+      : computedAreaM2;
+    const numericAvailableAreaM2 = available_area_m2 != null && available_area_m2 !== ''
+      ? parseFloat(available_area_m2)
+      : computedAreaM2;
 
-    const totalProdUnitNorm = normalizeTotalProductionUnit(
-      total_production_unit ?? totalProductionUnit ?? 'kg'
-    );
-    const productionRateUnitStored =
-      production_rate_unit && String(production_rate_unit).trim()
-        ? String(production_rate_unit).trim()
-        : productionRateUnitFromTotalUnit(totalProdUnitNorm);
-
-    // Handle delivery_charges - can be JSON array string, array, or numeric (backward compatibility)
-    let deliveryChargesJson = null;
-    if (delivery_charges) {
-      if (typeof delivery_charges === 'string') {
-        try {
-          deliveryChargesJson = JSON.parse(delivery_charges);
-        } catch {
-          // If not valid JSON, try parsing as number (backward compatibility)
-          const num = parseFloat(delivery_charges);
-          if (!isNaN(num)) {
-            deliveryChargesJson = JSON.stringify([{ upto: null, amount: num }]);
-          }
-        }
-      } else if (Array.isArray(delivery_charges)) {
-        deliveryChargesJson = delivery_charges;
-      } else {
-        // Numeric value
-        const num = parseFloat(delivery_charges);
-        if (!isNaN(num)) {
-          deliveryChargesJson = JSON.stringify([{ upto: null, amount: num }]);
-        }
-      }
-    }
+    const deliveryChargesJson = serializeDeliveryChargesForDb(delivery_charges);
 
     const shortDescVal = short_description != null ? short_description : shortDescription;
     const numericEstimatedDeliveryDays = parseEstimatedDeliveryDays(req.body);
@@ -820,6 +861,20 @@ router.post('/', async (req, res) => {
       shippingDestinationsArr,
       shipping_scope ?? 'Global'
     );
+    const shippingDestinationsJson = serializeJsonbParam(shippingDestinationsArr) ?? '[]';
+
+    const totalProdUnitNorm = normalizeTotalProductionUnit(
+      total_production_unit ?? totalProductionUnit ?? 'kg'
+    );
+    const productionRateUnitStored =
+      production_rate_unit && String(production_rate_unit).trim()
+        ? String(production_rate_unit).trim()
+        : productionRateUnitFromTotalUnit(totalProdUnitNorm);
+
+    const displayUnitStored =
+      display_unit && String(display_unit).trim()
+        ? String(display_unit).trim()
+        : (field_size_unit && String(field_size_unit).trim() ? String(field_size_unit).trim() : null);
 
     const result = await pool.query(
       `INSERT INTO fields (
@@ -836,7 +891,7 @@ router.post('/', async (req, res) => {
         quantity_sell_percent
 
         ) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57) 
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, $31, $32::jsonb, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53::jsonb, $54, $55, $56, $57) 
        RETURNING *`,
       [
         name, description, shortDescVal ?? null, coordinatesJson, location, image, resolvedFarmId, owner_id,
@@ -848,7 +903,7 @@ router.post('/', async (req, res) => {
         numericEstimatedDeliveryDays,
         availBuy, availRentVal, numericRentPrice, rentMonthly, rentQuarterly, rentYearly,
         numericTotalProduction, totalProdUnitNorm, numericDistributionPrice, numericRetailPrice, numericVirtualProd, numericVirtualCost, numericAppFees, numericPotentialIncome, numericUserRent
-        , numericTotalAreaM2, numericAvailableAreaM2, display_unit, JSON.stringify(shippingDestinationsArr), shippingScopeForInsert, shipping_pickup, shipping_delivery,
+        , numericTotalAreaM2, numericAvailableAreaM2, displayUnitStored, shippingDestinationsJson, shippingScopeForInsert, shipping_pickup, shipping_delivery,
         numericQuantitySellPercent
       ]
     );
@@ -1139,18 +1194,22 @@ router.put('/:id', async (req, res) => {
     const bool = (v) => v === true || v === 'true';
     const numericRentPrice = rent_price_per_month != null && rent_price_per_month !== '' ? parseFloat(rent_price_per_month) : null;
 
-    const coordinatesJson = coordinates ? JSON.stringify(coordinates) : null;
-    const harvestDatesJson = harvest_dates ? JSON.stringify(harvest_dates) : null;
+    const coordinatesJson = serializeJsonbParam(coordinates);
+    const harvestDatesJson = serializeJsonbParam(harvest_dates);
+    const deliveryChargesJsonUpdate =
+      delivery_charges !== undefined
+        ? serializeDeliveryChargesForDb(delivery_charges)
+        : serializeDeliveryChargesForDb(existingRow.delivery_charges);
 
     const result = await pool.query(
       `UPDATE fields 
-       SET name = $1, description = $2, coordinates = $3, location = $4, image = $5, 
+       SET name = $1, description = $2, coordinates = $3::jsonb, location = $4, image = $5, 
            farm_id = $6, field_size = $7, field_size_unit = $8, area_m2 = $9, 
            available_area = $10, total_area = $11, weather = $12, has_webcam = $13, webcam_url = $14, is_own_field = $15,
            category = $16, subcategory = $17, price = $18, price_per_m2 = $19, unit = $20, quantity = $21,
            farmer_name = $22, available = $23, rating = $24, reviews = $25,
-           production_rate = $26, production_rate_unit = $27, harvest_dates = $28,
-           shipping_option = $29, delivery_charges = $30, owner_id = $31,
+           production_rate = $26, production_rate_unit = $27, harvest_dates = $28::jsonb,
+           shipping_option = $29, delivery_charges = $30::jsonb, owner_id = $31,
            available_for_buy = $32, available_for_rent = $33, rent_price_per_month = $34,
            rent_duration_monthly = $35, rent_duration_quarterly = $36, rent_duration_yearly = $37,
            total_production = $39, distribution_price = $40, retail_price = $41,
@@ -1165,7 +1224,7 @@ router.put('/:id', async (req, res) => {
         name, description, coordinatesJson, location, image, farm_id, field_size, field_size_unit,
         area_m2, available_area, total_area, weather, has_webcam, webcam_url, is_own_field,
         category, subcategory, price, price_per_m2, unit, quantityForUpdate, farmer_name, available, rating, reviews,
-        production_rate, production_rate_unit_final, harvestDatesJson, shipping_option, delivery_charges, owner_id,
+        production_rate, production_rate_unit_final, harvestDatesJson, shipping_option, deliveryChargesJsonUpdate, owner_id,
         available_for_buy !== false && available_for_buy !== 'false',
         availRent,
         numericRentPrice,

@@ -7,26 +7,38 @@ function parsePositiveNumber(raw) {
     return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function m2PerFieldSizeUnit(fieldSizeUnit) {
+    const u = String(fieldSizeUnit || 'sqm').trim().toLowerCase();
+    if (u === 'acres' || u === 'acre') return 4046.8564224;
+    if (u === 'hectares' || u === 'hectare' || u === 'ha') return 10000;
+    if (u === 'sqft' || u === 'sq ft' || u === 'sq. ft' || u === 'ft2' || u === 'ft²') return 0.092903;
+    return 1;
+}
+
 /** Estimated kg for a renter's m² on this field (matches resource-bar logic). */
 function estimateKgForArea(fieldRow, areaM2) {
     const area = parsePositiveNumber(areaM2) || 0;
     if (area <= 0) return 0;
     const rateRaw = fieldRow.production_rate;
     const rate = typeof rateRaw === 'string' ? parseFloat(rateRaw) : Number(rateRaw) || 0;
-    const totalAreaRaw = fieldRow.total_area ?? fieldRow.total_area_m2 ?? fieldRow.area_m2;
-    const totalArea =
-        typeof totalAreaRaw === 'string' ? parseFloat(totalAreaRaw) : Number(totalAreaRaw) || 0;
-    const unit = (fieldRow.production_rate_unit || 'kg').toString().toLowerCase();
-    const isPerM2 = /m\s*2|m²|per\s*m|per\s*unit/.test(unit);
     if (!Number.isFinite(rate) || rate < 0) return 0;
+    const rateUnit = (fieldRow.production_rate_unit || '').toString().toLowerCase();
+    const isPerM2 = /m\s*²|\/m²|\/m2|\/sqm\b|kg\/m/.test(rateUnit);
     if (isPerM2) return area * rate;
-    if (totalArea > 0) return (area / totalArea) * rate;
+    const fieldUnit = fieldRow.field_size_unit || fieldRow.display_unit || 'sqm';
+    const m2PerUnit = m2PerFieldSizeUnit(fieldUnit);
+    if (m2PerUnit > 0) return area * (rate / m2PerUnit);
+    const totalAreaRaw = fieldRow.total_area_m2 ?? fieldRow.area_m2 ?? fieldRow.total_area;
+    const totalAreaM2 =
+        typeof totalAreaRaw === 'string' ? parseFloat(totalAreaRaw) : Number(totalAreaRaw) || 0;
+    if (totalAreaM2 > 0) return (area / totalAreaM2) * rate;
     return 0;
 }
 
 async function getFieldForOwner(fieldId, userId, isAdmin) {
     const { rows } = await pool.query(
         `SELECT id, farm_id, owner_id, name, total_area, total_area_m2, area_m2,
+                field_size_unit, display_unit,
                 production_rate, production_rate_unit, operational_status, subcategory, category
          FROM fields WHERE id = $1`,
         [fieldId]
