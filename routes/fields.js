@@ -80,10 +80,24 @@ function parseShippingDestinationsBody(body) {
       seen.add(key);
       out.push({ type: 'country', countryCode, ...(label ? { label } : {}) });
     } else if (type === 'city' && countryCode && city) {
-      const key = `t:${countryCode}:${city.toLowerCase()}`;
+      const region = item.region != null ? String(item.region).trim().slice(0, 120) : '';
+      const regionCode = item.regionCode != null ? String(item.regionCode).trim().slice(0, 20) : '';
+      const mapboxId = (item.mapboxId ?? item.mapbox_id) != null
+        ? String(item.mapboxId ?? item.mapbox_id).trim().slice(0, 120)
+        : '';
+      const key = mapboxId
+        ? `id:${mapboxId}`
+        : `t:${countryCode}:${city.toLowerCase()}:${region.toLowerCase()}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ type: 'city', countryCode, city, ...(label ? { label } : {}) });
+      const entry = { type: 'city', countryCode, city, ...(label ? { label } : {}) };
+      if (region) entry.region = region;
+      if (regionCode) entry.regionCode = regionCode;
+      if (mapboxId) entry.mapboxId = mapboxId;
+      if (Array.isArray(item.center) && item.center.length >= 2) {
+        entry.center = [Number(item.center[0]), Number(item.center[1])];
+      }
+      out.push(entry);
     }
     if (out.length >= MAX_SHIPPING_DESTINATIONS) break;
   }
