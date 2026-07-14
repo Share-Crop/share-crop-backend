@@ -13,7 +13,100 @@ const {
 const pendingRefundIdSql = `(SELECT r.id FROM order_refund_requests r WHERE r.order_id = o.id AND r.status = 'pending' ORDER BY r.created_at DESC LIMIT 1)`;
 const pendingRefundReasonSql = `(SELECT r.reason FROM order_refund_requests r WHERE r.order_id = o.id AND r.status = 'pending' ORDER BY r.created_at DESC LIMIT 1)`;
 
+/** Farmer order list: field yield + latest harvest event / allocation for this order. */
+const farmerOrdersBaseSelect = `
+            o.id,
+            o.quantity,
+            o.total_price,
+            o.status,
+            o.created_at,
+            o.selected_harvest_date,
+            o.selected_harvest_label,
+            o.mode_of_shipping,
+            o.notes,
+            f.id as field_id,
+            f.name as field_name,
+            f.location,
+            f.category as crop_type,
+            f.subcategory,
+            f.available_area,
+            f.total_area,
+            f.total_area_m2,
+            f.price_per_m2,
+            f.image as image_url,
+            f.owner_id as farmer_id,
+            f.farm_id,
+            f.operational_status,
+            f.total_production,
+            f.total_production_unit,
+            f.production_rate,
+            f.production_rate_unit,
+            f.estimated_delivery_days,
+            buyer.name as buyer_name,
+            buyer.email as buyer_email,
+            ${pendingRefundIdSql} AS pending_refund_request_id,
+            ${pendingRefundReasonSql} AS pending_refund_request_reason
+`;
+
+const farmerOrdersHarvestSelect = `
+            he.total_quantity AS field_harvest_total,
+            he.unit AS harvest_unit,
+            he.created_at AS harvest_declared_at,
+            ha.actual_kg AS harvest_allocated_qty,
+            ha.estimated_kg AS harvest_estimated_qty
+`;
+
+const farmerOrdersHarvestJoins = `
+            LEFT JOIN LATERAL (
+              SELECT e.id, e.total_quantity, e.unit, e.created_at
+              FROM field_harvest_events e
+              WHERE e.field_id = f.id
+              ORDER BY e.created_at DESC
+              LIMIT 1
+            ) he ON true
+            LEFT JOIN field_harvest_allocations ha
+              ON ha.harvest_event_id = he.id AND ha.order_id = o.id
+`;
+
 const ORDER_STATUSES = ['pending', 'active', 'shipped', 'completed', 'cancelled'];
+
+async function queryFarmerOrdersForOwner(farmerId) {
+    try {
+        const result = await pool.query(
+            `
+            SELECT
+                ${farmerOrdersBaseSelect},
+                ${farmerOrdersHarvestSelect}
+            FROM orders o
+            JOIN fields f ON o.field_id = f.id
+            LEFT JOIN users buyer ON o.buyer_id = buyer.id
+            ${farmerOrdersHarvestJoins}
+            WHERE f.owner_id = $1
+            ORDER BY o.created_at DESC
+            `,
+            [farmerId]
+        );
+        return result.rows;
+    } catch (err) {
+        // Migration 052 may not be applied yet — fall back without harvest joins.
+        if (err.code === '42P01') {
+            const result = await pool.query(
+                `
+                SELECT
+                    ${farmerOrdersBaseSelect}
+                FROM orders o
+                JOIN fields f ON o.field_id = f.id
+                LEFT JOIN users buyer ON o.buyer_id = buyer.id
+                WHERE f.owner_id = $1
+                ORDER BY o.created_at DESC
+                `,
+                [farmerId]
+            );
+            return result.rows;
+        }
+        throw err;
+    }
+}
 
 /** @returns {{ amount: number, unit: string, notes: string | null } | { error: string } | null} */
 function parseDeclaredHarvestFromBody(body) {
@@ -37,21 +130,24 @@ function parseDeclaredHarvestFromBody(body) {
 
 /** Enforce a sensible lifecycle; admins may bypass via caller. */
 function validateOrderStatusTransition(oldStatus, newStatus) {
-    if (oldStatus === newStatus) return { ok: true };
-    if (oldStatus === 'cancelled') {
+    const from = String(oldStatus || '').trim().toLowerCase();
+    const to = String(newStatus || '').trim().toLowerCase();
+    if (from === to) return { ok: true };
+    if (from === 'cancelled') {
         return { ok: false, error: 'Cannot change the status of a cancelled order.' };
     }
     const edges = {
         pending: ['active', 'cancelled'],
         active: ['shipped', 'completed', 'cancelled'],
         shipped: ['active', 'completed', 'cancelled'],
-        completed: ['cancelled'],
+        // After declaring harvest, orders become completed; farmer may still mark shipped for delivery.
+        completed: ['shipped', 'cancelled'],
     };
-    const allowed = edges[oldStatus];
-    if (!allowed || !allowed.includes(newStatus)) {
+    const allowed = edges[from];
+    if (!allowed || !allowed.includes(to)) {
         return {
             ok: false,
-            error: `Invalid status change (${oldStatus} → ${newStatus}). Typical flow: Pending → Active → Shipped → Completed.`,
+            error: `Invalid status change (${from} → ${to}). After harvest you can still mark Shipped, or use: Pending → Active → Shipped / Completed.`,
         };
     }
     return { ok: true };
@@ -139,38 +235,8 @@ router.get('/farmer-orders', async (req, res) => {
             return res.status(403).json({ error: 'Access denied' });
         }
 
-        const farmerOrders = await pool.query(`
-            SELECT 
-                o.id,
-                o.quantity,
-                o.total_price,
-                o.status,
-                o.created_at,
-                o.selected_harvest_date,
-                o.selected_harvest_label,
-                o.mode_of_shipping,
-                o.notes,
-                f.id as field_id,
-                f.name as field_name,
-                f.location,
-                f.category as crop_type,
-                f.available_area,
-                f.total_area,
-                f.price_per_m2,
-                f.image as image_url,
-                f.owner_id as farmer_id,
-                buyer.name as buyer_name,
-                buyer.email as buyer_email,
-                ${pendingRefundIdSql} AS pending_refund_request_id,
-                ${pendingRefundReasonSql} AS pending_refund_request_reason
-            FROM orders o
-            JOIN fields f ON o.field_id = f.id
-            LEFT JOIN users buyer ON o.buyer_id = buyer.id
-            WHERE f.owner_id = $1
-            ORDER BY o.created_at DESC
-        `, [targetFarmerId]);
-
-        res.json(farmerOrders.rows);
+        const rows = await queryFarmerOrdersForOwner(targetFarmerId);
+        res.json(rows);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -187,38 +253,8 @@ router.get('/farmer/:farmerId', async (req, res) => {
             return res.status(403).json({ error: 'Access denied' });
         }
 
-        const farmerOrders = await pool.query(`
-            SELECT 
-                o.id,
-                o.quantity,
-                o.total_price,
-                o.status,
-                o.created_at,
-                o.selected_harvest_date,
-                o.selected_harvest_label,
-                o.mode_of_shipping,
-                o.notes,
-                f.id as field_id,
-                f.name as field_name,
-                f.location,
-                f.category as crop_type,
-                f.available_area,
-                f.total_area,
-                f.price_per_m2,
-                f.image as image_url,
-                f.owner_id as farmer_id,
-                buyer.name as buyer_name,
-                buyer.email as buyer_email,
-                ${pendingRefundIdSql} AS pending_refund_request_id,
-                ${pendingRefundReasonSql} AS pending_refund_request_reason
-            FROM orders o
-            JOIN fields f ON o.field_id = f.id
-            LEFT JOIN users buyer ON o.buyer_id = buyer.id
-            WHERE f.owner_id = $1
-            ORDER BY o.created_at DESC
-        `, [farmerId]);
-
-        res.json(farmerOrders.rows);
+        const rows = await queryFarmerOrdersForOwner(farmerId);
+        res.json(rows);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -333,8 +369,8 @@ router.put('/:id/status', async (req, res) => {
                 );
             }
 
-            // Active → Shipped (no coin change; farmer already paid at Active)
-            if (oldStatus === 'active' && status === 'shipped') {
+            // Active/Completed → Shipped (no coin change; farmer already paid at Active)
+            if ((oldStatus === 'active' || oldStatus === 'completed') && status === 'shipped') {
                 await client.query(
                     'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
                     [
