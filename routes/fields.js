@@ -51,7 +51,7 @@ function normalizeIso2(code) {
 
 /**
  * Normalize shipping_destinations from API body to a JSON-serializable array.
- * Items: { type: 'country'|'city', countryCode: 'DE', city?: 'Berlin', label?: '...' }
+ * Items: { type: 'country'|'city'|'region', countryCode: 'DE', city?: 'Berlin', region?: 'Florida', ... }
  */
 function parseShippingDestinationsBody(body) {
   if (!body || typeof body !== 'object') return [];
@@ -74,14 +74,14 @@ function parseShippingDestinationsBody(body) {
     const countryCode = normalizeIso2(item.countryCode ?? item.country_code);
     const city = item.city != null ? String(item.city).trim().slice(0, 120) : '';
     const label = item.label != null ? String(item.label).trim().slice(0, 200) : '';
+    const region = item.region != null ? String(item.region).trim().slice(0, 120) : '';
+    const regionCode = item.regionCode != null ? String(item.regionCode).trim().slice(0, 20) : '';
     if (type === 'country' && countryCode) {
       const key = `c:${countryCode}`;
       if (seen.has(key)) continue;
       seen.add(key);
       out.push({ type: 'country', countryCode, ...(label ? { label } : {}) });
     } else if (type === 'city' && countryCode && city) {
-      const region = item.region != null ? String(item.region).trim().slice(0, 120) : '';
-      const regionCode = item.regionCode != null ? String(item.regionCode).trim().slice(0, 20) : '';
       const mapboxId = (item.mapboxId ?? item.mapbox_id) != null
         ? String(item.mapboxId ?? item.mapbox_id).trim().slice(0, 120)
         : '';
@@ -98,6 +98,15 @@ function parseShippingDestinationsBody(body) {
         entry.center = [Number(item.center[0]), Number(item.center[1])];
       }
       out.push(entry);
+    } else if (type === 'region' && countryCode && (region || regionCode)) {
+      const key = `r:${countryCode}:${(regionCode || region).toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const entry = { type: 'region', countryCode };
+      if (region) entry.region = region;
+      if (regionCode) entry.regionCode = regionCode;
+      if (label) entry.label = label;
+      out.push(entry);
     }
     if (out.length >= MAX_SHIPPING_DESTINATIONS) break;
   }
@@ -112,9 +121,9 @@ function deriveShippingScopeFromDestinations(destinations, clientScope) {
     return ['City', 'Country', 'Global'].includes(s) ? s : 'Global';
   }
   const countryOnly = d.every((x) => x.type === 'country');
-  const cityOnly = d.every((x) => x.type === 'city');
+  const placeOnly = d.every((x) => x.type === 'city' || x.type === 'region');
   if (countryOnly && d.length === 1) return 'Country';
-  if (cityOnly && d.length === 1) return 'City';
+  if (placeOnly && d.length === 1) return 'City';
   return 'Global';
 }
 
