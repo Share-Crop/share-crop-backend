@@ -15,10 +15,23 @@ function m2PerFieldSizeUnit(fieldSizeUnit) {
     return 1;
 }
 
-/** Estimated kg for a renter's m² on this field (matches resource-bar logic). */
+/** Estimated yield for a rented area: field setup total × (order m² / field m²). */
 function estimateKgForArea(fieldRow, areaM2) {
     const area = parsePositiveNumber(areaM2) || 0;
     if (area <= 0) return 0;
+
+    const totalProdRaw = fieldRow.total_production;
+    const totalProd =
+        typeof totalProdRaw === 'string' ? parseFloat(totalProdRaw) : Number(totalProdRaw);
+    const totalAreaRaw = fieldRow.total_area_m2 ?? fieldRow.area_m2 ?? fieldRow.total_area;
+    const totalAreaM2 =
+        typeof totalAreaRaw === 'string' ? parseFloat(totalAreaRaw) : Number(totalAreaRaw) || 0;
+
+    if (Number.isFinite(totalProd) && totalProd >= 0 && totalAreaM2 > 0) {
+        return totalProd * (area / totalAreaM2);
+    }
+
+    // Fallback: production_rate based estimate
     const rateRaw = fieldRow.production_rate;
     const rate = typeof rateRaw === 'string' ? parseFloat(rateRaw) : Number(rateRaw) || 0;
     if (!Number.isFinite(rate) || rate < 0) return 0;
@@ -28,9 +41,6 @@ function estimateKgForArea(fieldRow, areaM2) {
     const fieldUnit = fieldRow.field_size_unit || fieldRow.display_unit || 'sqm';
     const m2PerUnit = m2PerFieldSizeUnit(fieldUnit);
     if (m2PerUnit > 0) return area * (rate / m2PerUnit);
-    const totalAreaRaw = fieldRow.total_area_m2 ?? fieldRow.area_m2 ?? fieldRow.total_area;
-    const totalAreaM2 =
-        typeof totalAreaRaw === 'string' ? parseFloat(totalAreaRaw) : Number(totalAreaRaw) || 0;
     if (totalAreaM2 > 0) return (area / totalAreaM2) * rate;
     return 0;
 }
@@ -38,7 +48,7 @@ function estimateKgForArea(fieldRow, areaM2) {
 async function getFieldForOwner(fieldId, userId, isAdmin) {
     const { rows } = await pool.query(
         `SELECT id, farm_id, owner_id, name, total_area, total_area_m2, area_m2,
-                field_size_unit, display_unit,
+                field_size_unit, display_unit, total_production, total_production_unit,
                 production_rate, production_rate_unit, operational_status, subcategory, category
          FROM fields WHERE id = $1`,
         [fieldId]
