@@ -49,6 +49,7 @@ async function getFieldForOwner(fieldId, userId, isAdmin) {
     const { rows } = await pool.query(
         `SELECT id, farm_id, owner_id, name, total_area, total_area_m2, area_m2,
                 field_size_unit, display_unit, total_production, total_production_unit,
+                quantity_sell_percent, price, price_per_m2,
                 production_rate, production_rate_unit, operational_status, subcategory, category
          FROM fields WHERE id = $1`,
         [fieldId]
@@ -99,20 +100,14 @@ async function completeFieldHarvest(fieldId, farmerId, isAdmin, { totalQuantity,
         await client.query('BEGIN');
 
         const orders = await getActiveOrdersForField(client, fieldId);
-        if (orders.length === 0) {
-            await client.query('ROLLBACK');
-            return {
-                error: 'No active rentals on this field. There must be at least one active order to distribute harvest.',
-                status: 400,
-            };
-        }
 
         let totalRented = 0;
         for (const o of orders) {
             const q = parsePositiveNumber(o.quantity);
             if (q) totalRented += q;
         }
-        if (totalRented <= 0) {
+        // No active rentals is OK — farmer can still close the season (past harvest / unsold).
+        if (orders.length > 0 && totalRented <= 0) {
             await client.query('ROLLBACK');
             return { error: 'Could not compute rented area for distribution.', status: 400 };
         }
@@ -128,7 +123,7 @@ async function completeFieldHarvest(fieldId, farmerId, isAdmin, { totalQuantity,
 
         for (const o of orders) {
             const area = parsePositiveNumber(o.quantity) || 0;
-            if (area <= 0) continue;
+            if (area <= 0 || totalRented <= 0) continue;
             const share = area / totalRented;
             const estimated = estimateKgForArea(field, area);
             const actual = share * qty;
@@ -279,6 +274,252 @@ function isAutoAcceptOrdersEnabled() {
     return process.env.AUTO_ACCEPT_ORDERS !== '0' && process.env.AUTO_ACCEPT_ORDERS !== 'false';
 }
 
+async function listAgainField(fieldId, farmerId, isAdmin, body = {}) {
+    const access = await getFieldForOwner(fieldId, farmerId, isAdmin);
+    if (access.error) return access;
+    const { field } = access;
+
+    const status = String(field.operational_status || 'growing').toLowerCase();
+    if (status !== 'harvested' && status !== 'shipped') {
+        return {
+            error: 'Only harvested or shipped fields can be listed again for a new season.',
+            status: 400,
+        };
+    }
+
+    // Block if buyers still have pending/active commitments on this field.
+    const openOrders = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM orders
+         WHERE field_id = $1 AND LOWER(COALESCE(status, '')) IN ('pending', 'active')`,
+        [fieldId]
+    );
+    if ((openOrders.rows[0]?.n || 0) > 0) {
+        return {
+            error: 'Finish or cancel open pending/active orders before listing this field again.',
+            status: 400,
+        };
+    }
+
+    const harvestDatesRaw = body.harvest_dates ?? body.harvestDates;
+    let harvestDates = [];
+    if (typeof harvestDatesRaw === 'string') {
+        try {
+            harvestDates = JSON.parse(harvestDatesRaw);
+        } catch {
+            harvestDates = [];
+        }
+    } else if (Array.isArray(harvestDatesRaw)) {
+        harvestDates = harvestDatesRaw;
+    }
+    harvestDates = harvestDates
+        .map((h) => {
+            if (!h || typeof h !== 'object') return null;
+            const date = String(h.date || '').trim().slice(0, 10);
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+            return { date, label: String(h.label || '').trim().slice(0, 120) };
+        })
+        .filter(Boolean);
+    if (!harvestDates.length) {
+        return { error: 'At least one upcoming harvest date is required to list again.', status: 400 };
+    }
+    const today = new Date();
+    const todayYmd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    if (!harvestDates.some((h) => h.date >= todayYmd)) {
+        return { error: 'Harvest date must be today or in the future.', status: 400 };
+    }
+
+    const totalProduction = parsePositiveNumber(body.total_production ?? body.totalProduction);
+    if (!totalProduction) {
+        return { error: 'Expected total production for the new season is required.', status: 400 };
+    }
+
+    const price = parseFloat(String(body.price ?? body.sellingPrice ?? '').replace(/,/g, ''));
+    if (!Number.isFinite(price) || price < 0) {
+        return { error: 'App selling price is required.', status: 400 };
+    }
+
+    let sellPercent = body.quantity_sell_percent ?? body.quantitySellPercent ?? body.sellingAmount;
+    if (sellPercent == null || sellPercent === '') {
+        sellPercent = field.quantity_sell_percent != null ? field.quantity_sell_percent : 100;
+    }
+    sellPercent = parseFloat(String(sellPercent).replace(/,/g, ''));
+    if (!Number.isFinite(sellPercent) || sellPercent <= 0 || sellPercent > 100) {
+        return { error: 'Percent of harvest to sell must be between 0 and 100.', status: 400 };
+    }
+
+    const unit = String(
+        body.total_production_unit ?? body.totalProductionUnit ?? field.total_production_unit ?? 'kg'
+    )
+        .trim()
+        .slice(0, 32) || 'kg';
+
+    const totalAreaM2 =
+        parsePositiveNumber(field.total_area_m2) ||
+        parsePositiveNumber(field.area_m2) ||
+        parsePositiveNumber(field.total_area) ||
+        null;
+
+    const quantity = totalProduction * (sellPercent / 100);
+    const productionRate =
+        totalAreaM2 && totalAreaM2 > 0 ? Number((totalProduction / totalAreaM2).toFixed(6)) : null;
+    const productionRateUnit = `${unit}/m²`;
+
+    // price is USD per production unit (same as Create Field "Your App Selling Price")
+    // user_virtual_rent ≈ price * production per field-area unit; store price_per_m2 when possible
+    let pricePerM2 = null;
+    if (productionRate != null && productionRate > 0) {
+        pricePerM2 = Number((price * productionRate).toFixed(6));
+    }
+
+    const lastEvent = await pool.query(
+        `SELECT total_quantity, unit, created_at
+         FROM field_harvest_events
+         WHERE field_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [fieldId]
+    );
+    const last = lastEvent.rows[0] || null;
+
+    // Optional shipping refresh (destinations / scope / modes / charges).
+    // Null params keep existing DB values via COALESCE.
+    let shippingDestinationsJson = null;
+    let shippingScope = null;
+    let shippingOption = null;
+    let shippingPickup = null;
+    let shippingDelivery = null;
+    let deliveryChargesJson = null;
+
+    const hasDestKey =
+        Object.prototype.hasOwnProperty.call(body, 'shipping_destinations') ||
+        Object.prototype.hasOwnProperty.call(body, 'shippingDestinations');
+    if (hasDestKey) {
+        let raw = body.shipping_destinations ?? body.shippingDestinations;
+        if (typeof raw === 'string') {
+            try {
+                raw = JSON.parse(raw);
+            } catch {
+                raw = [];
+            }
+        }
+        shippingDestinationsJson = JSON.stringify(Array.isArray(raw) ? raw : []);
+    }
+
+    const scopeRaw = body.shipping_scope ?? body.shippingScope;
+    if (scopeRaw != null && String(scopeRaw).trim() !== '') {
+        const s = String(scopeRaw).trim();
+        shippingScope = ['City', 'Country', 'Global'].includes(s) ? s : 'Global';
+    } else if (hasDestKey) {
+        try {
+            const d = JSON.parse(shippingDestinationsJson || '[]');
+            if (!Array.isArray(d) || d.length === 0) {
+                shippingScope = 'Global';
+            } else if (d.every((x) => x && x.type === 'country') && d.length === 1) {
+                shippingScope = 'Country';
+            } else if (d.every((x) => x && (x.type === 'city' || x.type === 'region')) && d.length === 1) {
+                shippingScope = 'City';
+            } else {
+                shippingScope = 'Global';
+            }
+        } catch {
+            shippingScope = 'Global';
+        }
+    }
+
+    const optionRaw = body.shipping_option ?? body.shippingOption;
+    if (optionRaw != null && String(optionRaw).trim() !== '') {
+        shippingOption = String(optionRaw).trim().slice(0, 64);
+        if (Object.prototype.hasOwnProperty.call(body, 'shipping_pickup') || Object.prototype.hasOwnProperty.call(body, 'shippingPickup')) {
+            shippingPickup = Boolean(body.shipping_pickup ?? body.shippingPickup);
+        } else {
+            shippingPickup = shippingOption !== 'Shipping';
+        }
+        if (Object.prototype.hasOwnProperty.call(body, 'shipping_delivery') || Object.prototype.hasOwnProperty.call(body, 'shippingDelivery')) {
+            shippingDelivery = Boolean(body.shipping_delivery ?? body.shippingDelivery);
+        } else {
+            shippingDelivery = shippingOption !== 'Pickup';
+        }
+    }
+
+    const hasChargesKey =
+        Object.prototype.hasOwnProperty.call(body, 'delivery_charges') ||
+        Object.prototype.hasOwnProperty.call(body, 'deliveryCharges');
+    if (hasChargesKey) {
+        let charges = body.delivery_charges ?? body.deliveryCharges;
+        if (typeof charges === 'number' && Number.isFinite(charges)) {
+            deliveryChargesJson = JSON.stringify([{ upto: null, amount: charges }]);
+        } else if (typeof charges === 'string') {
+            const trimmed = charges.trim();
+            try {
+                const parsed = JSON.parse(trimmed);
+                deliveryChargesJson = JSON.stringify(parsed);
+            } catch {
+                const num = parseFloat(trimmed);
+                deliveryChargesJson = Number.isFinite(num)
+                    ? JSON.stringify([{ upto: null, amount: num }])
+                    : null;
+            }
+        } else if (Array.isArray(charges)) {
+            deliveryChargesJson = JSON.stringify(charges);
+        } else if (charges == null || charges === '') {
+            deliveryChargesJson = null;
+        }
+    }
+
+    const { rows } = await pool.query(
+        `UPDATE fields SET
+            operational_status = 'growing',
+            harvest_dates = $2::jsonb,
+            total_production = $3,
+            total_production_unit = $4,
+            quantity = $5,
+            quantity_sell_percent = $6,
+            production_rate = COALESCE($7, production_rate),
+            production_rate_unit = COALESCE($8, production_rate_unit),
+            price = $9,
+            price_per_m2 = COALESCE($10, price_per_m2),
+            available_area_m2 = COALESCE($11, available_area_m2),
+            available_area = COALESCE($11, available_area),
+            available = true,
+            shipping_destinations = COALESCE($12::jsonb, shipping_destinations),
+            shipping_scope = COALESCE($13, shipping_scope),
+            shipping_option = COALESCE($14, shipping_option),
+            shipping_pickup = COALESCE($15, shipping_pickup),
+            shipping_delivery = COALESCE($16, shipping_delivery),
+            delivery_charges = COALESCE($17::jsonb, delivery_charges)
+         WHERE id = $1
+         RETURNING *`,
+        [
+            fieldId,
+            JSON.stringify(harvestDates),
+            totalProduction,
+            unit,
+            quantity,
+            sellPercent,
+            productionRate,
+            productionRateUnit,
+            price,
+            pricePerM2,
+            totalAreaM2,
+            shippingDestinationsJson,
+            shippingScope,
+            shippingOption,
+            shippingPickup,
+            shippingDelivery,
+            deliveryChargesJson,
+        ]
+    );
+
+    const updated = rows[0];
+    if (last) {
+        updated.last_season_yield = parseFloat(last.total_quantity);
+        updated.last_season_yield_unit = last.unit;
+        updated.last_season_harvested_at = last.created_at;
+    }
+
+    return { field: updated, last_season_yield: last };
+}
+
 module.exports = {
     estimateKgForArea,
     completeFieldHarvest,
@@ -287,5 +528,6 @@ module.exports = {
     listAllocationsForBuyer,
     orderHasHarvestAllocation,
     isAutoAcceptOrdersEnabled,
+    listAgainField,
     ACTIVE_ORDER_STATUSES,
 };

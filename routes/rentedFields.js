@@ -46,7 +46,7 @@ router.get('/my-rentals', async (req, res) => {
              FROM orders o
              JOIN fields f ON f.id = o.field_id
              LEFT JOIN users u ON f.owner_id = u.id
-             WHERE o.buyer_id = $1 AND o.status IN ('pending', 'active', 'completed')
+             WHERE o.buyer_id = $1 AND o.status IN ('pending', 'active', 'completed', 'shipped')
              ORDER BY o.created_at DESC`,
             [req.user.id]
         );

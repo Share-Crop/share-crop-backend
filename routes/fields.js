@@ -6,7 +6,41 @@ const {
   completeFieldHarvest,
   markFieldShipped,
   listHarvestEventsForField,
+  listAgainField,
 } = require('../src/modules/fields/fieldHarvestService');
+
+async function attachLastSeasonYield(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const ids = rows.map((r) => r.id).filter(Boolean);
+  if (!ids.length) return;
+  try {
+    const { rows: events } = await pool.query(
+      `SELECT DISTINCT ON (field_id)
+          field_id, total_quantity, unit, created_at
+       FROM field_harvest_events
+       WHERE field_id = ANY($1::uuid[])
+       ORDER BY field_id, created_at DESC`,
+      [ids]
+    );
+    const byId = new Map(events.map((e) => [String(e.field_id), e]));
+    for (const row of rows) {
+      const e = byId.get(String(row.id));
+      if (!e) {
+        row.last_season_yield = null;
+        row.last_season_yield_unit = null;
+        row.last_season_harvested_at = null;
+        continue;
+      }
+      const qty = parseFloat(e.total_quantity);
+      row.last_season_yield = Number.isFinite(qty) ? qty : null;
+      row.last_season_yield_unit = e.unit || null;
+      row.last_season_harvested_at = e.created_at || null;
+    }
+  } catch (err) {
+    // Table may be missing on older DBs — leave fields without last-season data.
+    if (err.code !== '42P01') console.warn('attachLastSeasonYield:', err.message);
+  }
+}
 
 /** Canonical harvest yield unit (migration 042: total_production_unit). */
 function normalizeTotalProductionUnit(raw) {
@@ -273,6 +307,7 @@ router.get('/', async (req, res) => {
     }
 
     const result = await pool.query(query, values);
+    await attachLastSeasonYield(result.rows);
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -324,7 +359,7 @@ router.get('/all', async (req, res) => {
        ) inner_f
        LEFT JOIN (
          SELECT o.field_id,
-                COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) <> 'cancelled' THEN o.quantity ELSE 0 END), 0)::numeric AS occupied_total_m2
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) IN ('pending', 'active') THEN o.quantity ELSE 0 END), 0)::numeric AS occupied_total_m2
          FROM orders o
          GROUP BY o.field_id
        ) order_occ ON order_occ.field_id = inner_f.id`,
@@ -332,6 +367,7 @@ router.get('/all', async (req, res) => {
     );
 
     await attachGalleryToFieldRows(result.rows);
+    await attachLastSeasonYield(result.rows);
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -395,7 +431,7 @@ router.get('/public', async (req, res) => {
          (SELECT COALESCE(json_agg(fi.image_url ORDER BY fi.sort_order), '[]'::json)
           FROM field_images fi WHERE fi.field_id = f.id) AS gallery_images,
          u.name AS farmer_name,
-         (SELECT COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) <> 'cancelled' THEN o.quantity ELSE 0 END), 0)::numeric
+         (SELECT COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) IN ('pending', 'active') THEN o.quantity ELSE 0 END), 0)::numeric
           FROM orders o WHERE o.field_id = f.id) AS occupied_total_m2
        FROM fields f
        LEFT JOIN users u ON f.owner_id = u.id
@@ -415,6 +451,7 @@ router.get('/public', async (req, res) => {
        ORDER BY f.created_at DESC`
     );
 
+    await attachLastSeasonYield(result.rows);
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -528,8 +565,8 @@ router.get('/:id/occupancy', async (req, res) => {
     const uid = req.user && req.user.id ? req.user.id : null;
     const occ = await pool.query(
       `SELECT
-         COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) <> 'cancelled' THEN o.quantity ELSE 0 END), 0)::numeric AS occupied_total,
-         COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) <> 'cancelled' AND $2::uuid IS NOT NULL AND o.buyer_id = $2 THEN o.quantity ELSE 0 END), 0)::numeric AS my_m2
+         COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) IN ('pending', 'active') THEN o.quantity ELSE 0 END), 0)::numeric AS occupied_total,
+         COALESCE(SUM(CASE WHEN LOWER(COALESCE(o.status, '')) IN ('pending', 'active') AND $2::uuid IS NOT NULL AND o.buyer_id = $2 THEN o.quantity ELSE 0 END), 0)::numeric AS my_m2
        FROM orders o
        WHERE o.field_id = $1`,
       [id, uid]
@@ -662,6 +699,24 @@ router.post('/:id/complete-harvest', async (req, res) => {
   }
 });
 
+/** List harvested/shipped field again for a new season (minimal commercial refresh). */
+router.post('/:id/list-again', async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const isAdmin = String(user.user_type || '').toLowerCase() === 'admin';
+    const result = await listAgainField(req.params.id, user.id, isAdmin, req.body || {});
+    if (result.error) return res.status(result.status || 400).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    if (err.code === '42P01') {
+      return res.status(500).json({ error: 'Harvest workflow tables missing. Run migration 052_field_harvest_workflow.sql.' });
+    }
+    return res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
 /** Mark field as shipped; syncs related orders to shipped */
 router.post('/:id/mark-shipped', async (req, res) => {
   try {
@@ -704,6 +759,7 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ msg: 'Field not found' });
     }
     await attachGalleryToFieldRows(field.rows);
+    await attachLastSeasonYield(field.rows);
     res.json(field.rows[0]);
   } catch (err) {
     console.error(err.message);

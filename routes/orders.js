@@ -42,30 +42,32 @@ const farmerOrdersBaseSelect = `
             f.production_rate,
             f.production_rate_unit,
             f.estimated_delivery_days,
+            f.harvest_dates AS field_harvest_dates,
             buyer.name as buyer_name,
             buyer.email as buyer_email,
             ${pendingRefundIdSql} AS pending_refund_request_id,
             ${pendingRefundReasonSql} AS pending_refund_request_reason
 `;
 
+/** Prefer THIS order's harvest allocation (past season safe after list-again). */
 const farmerOrdersHarvestSelect = `
             he.total_quantity AS field_harvest_total,
             he.unit AS harvest_unit,
             he.created_at AS harvest_declared_at,
-            ha.actual_kg AS harvest_allocated_qty,
-            ha.estimated_kg AS harvest_estimated_qty
+            he.actual_kg AS harvest_allocated_qty,
+            he.estimated_kg AS harvest_estimated_qty
 `;
 
 const farmerOrdersHarvestJoins = `
             LEFT JOIN LATERAL (
-              SELECT e.id, e.total_quantity, e.unit, e.created_at
-              FROM field_harvest_events e
-              WHERE e.field_id = f.id
+              SELECT e.id, e.total_quantity, e.unit, e.created_at,
+                     ha.actual_kg, ha.estimated_kg
+              FROM field_harvest_allocations ha
+              JOIN field_harvest_events e ON e.id = ha.harvest_event_id
+              WHERE ha.order_id = o.id
               ORDER BY e.created_at DESC
               LIMIT 1
             ) he ON true
-            LEFT JOIN field_harvest_allocations ha
-              ON ha.harvest_event_id = he.id AND ha.order_id = o.id
 `;
 
 const ORDER_STATUSES = ['pending', 'active', 'shipped', 'completed', 'cancelled'];
@@ -517,15 +519,18 @@ router.get('/my-orders', async (req, res) => {
                     o.selected_harvest_date,
                     o.selected_harvest_label,
                     o.mode_of_shipping,
+                    o.notes,
                     f.id as field_id,
                     f.name as field_name,
                     f.location,
                     f.category as crop_type,
+                    f.subcategory,
                     f.available_area,
                     f.total_area,
                     f.price_per_m2,
                     f.image as image_url,
                     f.owner_id as farmer_id,
+                    f.harvest_dates AS field_harvest_dates,
                     u.name as farmer_name,
                     u.email as farmer_email,
                     ${pendingRefundIdSql} AS pending_refund_request_id,
@@ -568,15 +573,21 @@ router.get('/buyer/:buyerId', async (req, res) => {
                 o.selected_harvest_date,
                 o.selected_harvest_label,
                 o.mode_of_shipping,
+                o.notes,
                 f.id as field_id,
                 f.name as field_name,
                 f.location,
                 f.category as crop_type,
+                f.subcategory,
                 f.available_area,
                 f.total_area,
+                f.total_area_m2,
                 f.price_per_m2,
                 f.image as image_url,
                 f.owner_id as farmer_id,
+                f.estimated_delivery_days,
+                f.harvest_dates AS field_harvest_dates,
+                f.operational_status,
                 u.name as farmer_name,
                 u.email as farmer_email,
                 ${pendingRefundIdSql} AS pending_refund_request_id,
