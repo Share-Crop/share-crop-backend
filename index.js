@@ -42,10 +42,40 @@ app.get('/db-test', async (req, res) => {
   }
 });
 
-// Configure CORS explicitly for frontend origin
-const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000';
+// CORS: allow comma-separated origins from env + known ShareCrop frontends.
+// Browsers send Origin: https://sharecrop.farm (or www) — a single localhost value
+// blocks all production API calls until CORS_ORIGIN is set correctly on the host.
+function buildAllowedOrigins() {
+  const set = new Set([
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://sharecrop.farm',
+    'https://www.sharecrop.farm',
+  ]);
+  const fromEnv = [
+    process.env.CORS_ORIGIN,
+    process.env.FRONTEND_URL,
+    process.env.CHECKOUT_ALLOWED_ORIGINS,
+  ];
+  for (const raw of fromEnv) {
+    if (!raw) continue;
+    for (const part of String(raw).split(',')) {
+      const o = part.trim().replace(/\/$/, '');
+      if (o) set.add(o);
+    }
+  }
+  return [...set];
+}
+
+const allowedOrigins = buildAllowedOrigins();
 app.use(cors({
-  origin: allowedOrigin,
+  origin(origin, callback) {
+    // Non-browser / same-origin / server-to-server (no Origin header)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    console.warn(`[CORS] blocked origin: ${origin}`);
+    return callback(null, false);
+  },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: false,
