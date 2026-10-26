@@ -18,7 +18,11 @@ function tryOriginFromEnv(value) {
  * @returns {string[]} list of allowed origins (e.g. https://app.example.com)
  */
 function getAllowedCheckoutOrigins() {
-  const origins = new Set();
+  const origins = new Set([
+    // Production ShareCrop frontends (domain cutover from *.vercel.app)
+    'https://sharecrop.farm',
+    'https://www.sharecrop.farm',
+  ]);
 
   const cors = process.env.CORS_ORIGIN || '';
   for (const part of cors.split(',')) {
@@ -43,11 +47,10 @@ function getAllowedCheckoutOrigins() {
     if (o) origins.add(o);
   }
 
-  if (process.env.NODE_ENV !== 'production') {
-    ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'].forEach(
-      (u) => origins.add(u)
-    );
-  }
+  // Always allow local SPA during developer testing (even if NODE_ENV=production on a laptop).
+  ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'].forEach(
+    (u) => origins.add(u)
+  );
 
   return [...origins];
 }
