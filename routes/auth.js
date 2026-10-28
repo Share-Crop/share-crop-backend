@@ -493,4 +493,150 @@ router.put('/password', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/auth/become-farmer
+ * Convert an authenticated buyer into a farmer.
+ * Collects farmer-only extras (license docs, optional profile image).
+ * Sets approval_status to pending so admins can review like new farmer signups.
+ */
+router.post('/become-farmer', async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const current = await pool.query(
+      `SELECT id, name, email, user_type, email_verified, is_active, approval_status,
+              coins, profile_image_url, preferred_currency, created_at
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = current.rows[0];
+    const role = String(user.user_type || '').toLowerCase();
+    if (role === 'farmer') {
+      return res.status(400).json({ error: 'You are already registered as a farmer' });
+    }
+    if (role !== 'buyer') {
+      return res.status(403).json({ error: 'Only buyers can convert to a farmer account' });
+    }
+
+    const { documents, profile_image_url } = req.body || {};
+    const docs = Array.isArray(documents) ? documents : [];
+    const validDocs = docs.filter((d) => d && d.file_name && d.file_url);
+    if (validDocs.length === 0) {
+      return res.status(400).json({
+        error: 'Please upload at least one farming license document to become a farmer',
+      });
+    }
+
+    const client = await pool.connect();
+    let updatedUser;
+    try {
+      await client.query('BEGIN');
+
+      const nextProfile =
+        profile_image_url && String(profile_image_url).trim()
+          ? String(profile_image_url).trim()
+          : user.profile_image_url;
+
+      let upd;
+      try {
+        upd = await client.query(
+          `UPDATE users
+           SET user_type = 'farmer',
+               approval_status = 'pending',
+               is_active = TRUE,
+               profile_image_url = COALESCE($2, profile_image_url),
+               converted_to_farmer_at = NOW(),
+               updated_at = NOW()
+           WHERE id = $1 AND LOWER(user_type) = 'buyer'
+           RETURNING id, name, email, user_type, email_verified, is_active, approval_status,
+                     coins, profile_image_url, preferred_currency, created_at, converted_to_farmer_at`,
+          [user.id, nextProfile]
+        );
+      } catch (colErr) {
+        if (colErr.code !== '42703') throw colErr;
+        // Migration 054 not applied yet — still convert without audit column
+        upd = await client.query(
+          `UPDATE users
+           SET user_type = 'farmer',
+               approval_status = 'pending',
+               is_active = TRUE,
+               profile_image_url = COALESCE($2, profile_image_url),
+               updated_at = NOW()
+           WHERE id = $1 AND LOWER(user_type) = 'buyer'
+           RETURNING id, name, email, user_type, email_verified, is_active, approval_status,
+                     coins, profile_image_url, preferred_currency, created_at`,
+          [user.id, nextProfile]
+        );
+      }
+
+      if (upd.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Could not convert account. Please refresh and try again.' });
+      }
+      updatedUser = upd.rows[0];
+
+      for (const doc of validDocs) {
+        await client.query(
+          `INSERT INTO user_documents (user_id, file_name, file_url, file_type)
+           VALUES ($1, $2, $3, $4)`,
+          [
+            user.id,
+            String(doc.file_name).slice(0, 500),
+            String(doc.file_url).slice(0, 2000),
+            String(doc.file_type || 'license').slice(0, 100),
+          ]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const token = generateToken(updatedUser);
+
+    const docsResult = await pool.query(
+      'SELECT id, file_name, file_url, file_type, uploaded_at FROM user_documents WHERE user_id = $1 ORDER BY uploaded_at DESC',
+      [user.id]
+    );
+
+    return res.json({
+      message: 'You are now a farmer. Your license is pending admin approval.',
+      token,
+      user: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        user_type: updatedUser.user_type,
+        email_verified: updatedUser.email_verified || false,
+        is_active: updatedUser.is_active,
+        approval_status: updatedUser.approval_status,
+        coins: updatedUser.coins || 0,
+        profile_image_url: updatedUser.profile_image_url,
+        preferred_currency: updatedUser.preferred_currency,
+        created_at: updatedUser.created_at,
+        converted_to_farmer_at: updatedUser.converted_to_farmer_at,
+        uploaded_documents: docsResult.rows,
+      },
+    });
+  } catch (err) {
+    console.error('Become farmer error:', err.message);
+    if (err.code === '42703') {
+      return res.status(500).json({
+        error: 'Database missing converted_to_farmer_at. Run migration 054_buyer_become_farmer.sql',
+      });
+    }
+    return res.status(500).json({ error: 'Server Error', details: err.message });
+  }
+});
+
 module.exports = router;
