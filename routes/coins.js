@@ -5,6 +5,7 @@ const redemptionService = require('../src/modules/redemption/redemptionService')
 const packageService = require('../src/modules/coins/packageService');
 const authenticate = require('../src/middleware/auth/authenticate');
 const { resolveValidatedCheckoutUrls } = require('../src/utils/stripeCheckoutUrlAllowlist');
+const { fulfillCheckoutSession } = require('../src/modules/coins/fulfillCheckoutSession');
 
 /** 5% app fee on coin purchases (added in Stripe as its own line item). */
 const COIN_PURCHASE_APP_FEE_RATE = 0.05;
@@ -267,6 +268,89 @@ router.post('/purchase-intent', authenticate, async (req, res) => {
         return res.json({ url: session.url, sessionId: session.id });
     } catch (err) {
         console.error('Error creating purchase intent:', err.message);
+        res.status(500).json({ error: 'Server Error', message: err.message });
+    }
+});
+
+/**
+ * Confirm a Checkout session after Stripe redirects back (webhook fallback).
+ * Verifies payment with Stripe API, then credits coins idempotently.
+ */
+router.post('/confirm-session', authenticate, async (req, res) => {
+    try {
+        if (!req.user || !req.user.id) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+
+        const sessionId = (req.body?.session_id || req.query?.session_id || '').trim();
+        if (!sessionId || !sessionId.startsWith('cs_')) {
+            return res.status(400).json({ error: 'Valid session_id is required' });
+        }
+
+        const Stripe = require('stripe');
+        const stripeSecret = process.env.STRIPE_SECRET_KEY;
+        if (!stripeSecret) {
+            return res.status(503).json({ error: 'Payment service not configured' });
+        }
+        const stripe = new Stripe(stripeSecret, { apiVersion: '2023-10-16' });
+
+        let session;
+        try {
+            session = await stripe.checkout.sessions.retrieve(sessionId);
+        } catch (err) {
+            console.error('[Confirm Session] Stripe retrieve failed:', err.message);
+            return res.status(404).json({ error: 'Checkout session not found' });
+        }
+
+        const refUser = session.client_reference_id || session.metadata?.user_id;
+        if (!refUser || String(refUser) !== String(req.user.id)) {
+            return res.status(403).json({ error: 'This checkout session does not belong to you' });
+        }
+
+        const purchaseCheck = await pool.query(
+            'SELECT id, farmer_id, status FROM coin_purchases WHERE payment_ref = $1',
+            [sessionId]
+        );
+        if (purchaseCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Purchase record not found' });
+        }
+        if (String(purchaseCheck.rows[0].farmer_id) !== String(req.user.id)) {
+            return res.status(403).json({ error: 'This purchase does not belong to you' });
+        }
+
+        const result = await fulfillCheckoutSession(session);
+
+        if (result.status === 'error') {
+            return res.status(500).json({ error: 'Could not credit coins', reason: result.reason });
+        }
+        if (result.status === 'skipped' && result.reason === 'not_paid') {
+            return res.status(402).json({
+                error: 'Payment not completed yet',
+                status: result.status,
+                reason: result.reason,
+            });
+        }
+        if (result.status === 'skipped') {
+            console.warn('[Confirm Session] Skipped:', sessionId, result.reason);
+            return res.status(409).json({
+                error: 'Could not fulfill purchase',
+                status: result.status,
+                reason: result.reason,
+            });
+        }
+
+        const balanceResult = await pool.query('SELECT coins FROM users WHERE id = $1', [req.user.id]);
+        const coins = Number(balanceResult.rows[0]?.coins) || result.balanceAfter || 0;
+
+        return res.json({
+            ok: true,
+            status: result.status,
+            coinsAdded: result.coinsAdded || 0,
+            coins,
+            purchaseId: result.purchaseId,
+        });
+    } catch (err) {
+        console.error('[Confirm Session] Error:', err.message);
         res.status(500).json({ error: 'Server Error', message: err.message });
     }
 });
