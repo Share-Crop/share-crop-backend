@@ -90,6 +90,7 @@ app.use('/api/webhooks', webhooksRoutes);
 app.use(express.json()); // Parse JSON request bodies for all other routes
 // Public product icon overrides (used by map UI; no auth)
 app.use('/api/product-category-icons', require('./routes/productCategoryIcons'));
+app.use('/api', require('./routes/categoryRequests'));
 
 const { runPendingOrderExpiryJob } = require('./src/modules/orders/expirePendingOrders');
 

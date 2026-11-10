@@ -84,4 +84,9 @@ router.get('/product-category-icons', adminProductIconsController.list);
 router.put('/product-category-icons', adminProductIconsController.upsert);
 router.delete('/product-category-icons', adminProductIconsController.remove);
 
+// Category requests (farmer-submitted titles awaiting approval)
+const adminCategoryRequestsController = require('../controllers/adminCategoryRequestsController');
+router.get('/category-requests', adminCategoryRequestsController.listCategoryRequests);
+router.patch('/category-requests/:id', adminCategoryRequestsController.updateCategoryRequest);
+
 module.exports = router;
