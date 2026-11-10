@@ -1,26 +1,51 @@
 const pool = require('../../../../db');
 
+async function safeCount(sql, fallback = 0) {
+  try {
+    const result = await pool.query(sql);
+    return result.rows[0]?.count ?? fallback;
+  } catch (err) {
+    if (err && (err.code === '42P01' || err.code === '42703')) return fallback;
+    throw err;
+  }
+}
+
 async function overview(req, res) {
   try {
-    const out = {};
-    const newUsers = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'");
-    out.newUserRegistrations = newUsers.rows[0].count;
-    try {
-      const pendingFarmers = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE user_type = 'farmer' AND approval_status = 'pending'");
-      out.pendingFarmerApprovals = pendingFarmers.rows[0].count;
-    } catch (err) {
-      return res.status(500).json({ error: 'Schema requires users.approval_status' });
-    }
-    try {
-      const complaints = await pool.query("SELECT COUNT(*)::int AS count FROM complaints WHERE status IN ('open','in_review')");
-      out.newComplaints = complaints.rows[0].count;
-    } catch (err) {
-      const code = err && err.code;
-      if (code === '42P01') return res.status(500).json({ error: 'Schema requires complaints table' });
-      return res.status(500).json({ error: 'Server Error' });
-    }
+    const out = {
+      newUserRegistrations: 0,
+      pendingFarmerApprovals: 0,
+      newComplaints: 0,
+      pendingCategoryRequests: 0,
+      pendingRedemptions: 0,
+      totalAttention: 0,
+    };
+
+    out.newUserRegistrations = await safeCount(
+      "SELECT COUNT(*)::int AS count FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'"
+    );
+    out.pendingFarmerApprovals = await safeCount(
+      "SELECT COUNT(*)::int AS count FROM users WHERE user_type = 'farmer' AND approval_status = 'pending'"
+    );
+    out.newComplaints = await safeCount(
+      "SELECT COUNT(*)::int AS count FROM complaints WHERE status IN ('open','in_review')"
+    );
+    out.pendingCategoryRequests = await safeCount(
+      "SELECT COUNT(*)::int AS count FROM category_requests WHERE status = 'pending'"
+    );
+    out.pendingRedemptions = await safeCount(
+      "SELECT COUNT(*)::int AS count FROM redemption_requests WHERE status IN ('pending','under_review')"
+    );
+
+    out.totalAttention =
+      Number(out.pendingFarmerApprovals || 0) +
+      Number(out.newComplaints || 0) +
+      Number(out.pendingCategoryRequests || 0) +
+      Number(out.pendingRedemptions || 0);
+
     res.json(out);
   } catch (err) {
+    console.error('[admin notifications overview]', err.message);
     res.status(500).json({ error: 'Server Error' });
   }
 }
