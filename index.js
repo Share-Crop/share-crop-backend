@@ -90,7 +90,6 @@ app.use('/api/webhooks', webhooksRoutes);
 app.use(express.json()); // Parse JSON request bodies for all other routes
 // Public product icon overrides (used by map UI; no auth)
 app.use('/api/product-category-icons', require('./routes/productCategoryIcons'));
-app.use('/api', require('./routes/categoryRequests'));
 
 const { runPendingOrderExpiryJob } = require('./src/modules/orders/expirePendingOrders');
 
@@ -128,6 +127,8 @@ app.get('/api/cron/expire-pending-orders', handleExpirePendingOrdersCron);
 app.post('/api/cron/expire-pending-orders', handleExpirePendingOrdersCron);
 
 app.use(attachUser);
+// Category catalog + requests must run after attachUser so JWT populates req.user
+app.use('/api', require('./routes/categoryRequests'));
 app.use('/api/users', usersRoutes);
 app.use('/api/farms', farmsRoutes);
 app.use('/api/fields', fieldsRoutes); // Use fields routes
