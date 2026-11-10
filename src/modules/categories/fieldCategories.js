@@ -47,31 +47,56 @@ function cloneStatic() {
   return out;
 }
 
+function findParentKey(merged, parentLabel) {
+  const want = String(parentLabel || '').trim().toLowerCase();
+  if (!want) return null;
+  return Object.keys(merged).find((k) => k.toLowerCase() === want) || null;
+}
+
+function hasSubInParent(merged, parentKey, title) {
+  const list = merged[parentKey] || [];
+  const want = String(title || '').trim().toLowerCase();
+  return list.some((s) => String(s).trim().toLowerCase() === want);
+}
+
 /**
- * Merge static categories with approved custom titles.
- * Each approved title becomes a parent category with itself as the only subcategory
- * (so both create-field dropdowns work without extra admin fields).
+ * Merge static categories with approved custom requests.
+ * - category: new parent with itself as the default product type
+ * - subcategory: product type appended under an existing parent
  */
 async function mergeFieldCategories() {
   const merged = cloneStatic();
   try {
     const result = await pool.query(
-      `SELECT title FROM category_requests
+      `SELECT title, COALESCE(request_type, 'category') AS request_type, parent_category
+       FROM category_requests
        WHERE status = 'approved'
-       ORDER BY title ASC`
+       ORDER BY created_at ASC`
     );
     for (const row of result.rows) {
       const title = String(row.title || '').trim();
       if (!title) continue;
+      const type = row.request_type === 'subcategory' ? 'subcategory' : 'category';
+
+      if (type === 'subcategory') {
+        const parentKey = findParentKey(merged, row.parent_category);
+        if (!parentKey) continue;
+        if (!hasSubInParent(merged, parentKey, title)) {
+          merged[parentKey] = [...merged[parentKey], title];
+        }
+        continue;
+      }
+
+      // New parent category (legacy approved rows included)
       if (!merged[title]) {
         merged[title] = [title];
-      } else if (!merged[title].includes(title)) {
+      } else if (!hasSubInParent(merged, title, title)) {
         merged[title] = [...merged[title], title];
       }
     }
   } catch (err) {
-    // Table may not exist yet on older deploys — still return static.
-    if (err.code !== '42P01') {
+    // Table / columns may not exist yet on older deploys — still return static.
+    if (err.code !== '42P01' && err.code !== '42703') {
       console.warn('[fieldCategories] merge failed:', err.message);
     }
   }
@@ -81,4 +106,6 @@ async function mergeFieldCategories() {
 module.exports = {
   STATIC_FIELD_CATEGORY_DATA,
   mergeFieldCategories,
+  findParentKey,
+  hasSubInParent,
 };

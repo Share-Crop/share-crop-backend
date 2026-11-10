@@ -1,4 +1,9 @@
 const pool = require('../../../../db');
+const {
+  mergeFieldCategories,
+  findParentKey,
+  hasSubInParent,
+} = require('../../categories/fieldCategories');
 
 async function listCategoryRequests(req, res) {
   try {
@@ -15,6 +20,8 @@ async function listCategoryRequests(req, res) {
       SELECT
         cr.id,
         cr.title,
+        COALESCE(cr.request_type, 'category') AS request_type,
+        cr.parent_category,
         cr.status,
         cr.admin_notes,
         cr.requested_by,
@@ -56,27 +63,71 @@ async function updateCategoryRequest(req, res) {
     }
 
     const existing = await pool.query(
-      `SELECT id, title, status FROM category_requests WHERE id = $1`,
+      `SELECT id, title, status,
+              COALESCE(request_type, 'category') AS request_type,
+              parent_category
+       FROM category_requests WHERE id = $1`,
       [id]
     );
     if (!existing.rows.length) {
       return res.status(404).json({ error: 'Request not found' });
     }
-    if (existing.rows[0].status !== 'pending') {
-      return res.status(400).json({ error: `Request is already ${existing.rows[0].status}` });
+    const row = existing.rows[0];
+    if (row.status !== 'pending') {
+      return res.status(400).json({ error: `Request is already ${row.status}` });
     }
 
     const newStatus = action === 'approve' ? 'approved' : 'rejected';
+    const requestType = row.request_type === 'subcategory' ? 'subcategory' : 'category';
 
     if (action === 'approve') {
-      const clash = await pool.query(
-        `SELECT id FROM category_requests
-         WHERE status = 'approved' AND lower(trim(title)) = lower(trim($1)) AND id <> $2
-         LIMIT 1`,
-        [existing.rows[0].title, id]
-      );
-      if (clash.rows.length) {
-        return res.status(409).json({ error: 'An approved category with this title already exists' });
+      const catalog = await mergeFieldCategories();
+
+      if (requestType === 'category') {
+        if (findParentKey(catalog, row.title)) {
+          return res.status(409).json({
+            error: `Category “${row.title}” already exists in the create-field list`,
+          });
+        }
+        const clash = await pool.query(
+          `SELECT id FROM category_requests
+           WHERE status = 'approved'
+             AND COALESCE(request_type, 'category') = 'category'
+             AND lower(trim(title)) = lower(trim($1))
+             AND id <> $2
+           LIMIT 1`,
+          [row.title, id]
+        );
+        if (clash.rows.length) {
+          return res.status(409).json({ error: 'An approved category with this title already exists' });
+        }
+      } else {
+        const parentKey = findParentKey(catalog, row.parent_category);
+        if (!parentKey) {
+          return res.status(400).json({
+            error: `Parent category “${row.parent_category}” is not available. Reject or ask the farmer to resubmit under a valid category.`,
+          });
+        }
+        if (hasSubInParent(catalog, parentKey, row.title)) {
+          return res.status(409).json({
+            error: `“${row.title}” is already listed under ${parentKey}`,
+          });
+        }
+        const clash = await pool.query(
+          `SELECT id FROM category_requests
+           WHERE status = 'approved'
+             AND request_type = 'subcategory'
+             AND lower(trim(parent_category)) = lower(trim($1))
+             AND lower(trim(title)) = lower(trim($2))
+             AND id <> $3
+           LIMIT 1`,
+          [parentKey, row.title, id]
+        );
+        if (clash.rows.length) {
+          return res.status(409).json({
+            error: `An approved product type “${row.title}” already exists under ${parentKey}`,
+          });
+        }
       }
     }
 
@@ -87,7 +138,8 @@ async function updateCategoryRequest(req, res) {
            reviewed_by = $3,
            reviewed_at = NOW()
        WHERE id = $4 AND status = 'pending'
-       RETURNING id, title, status, admin_notes, reviewed_at, created_at`,
+       RETURNING id, title, COALESCE(request_type, 'category') AS request_type,
+                 parent_category, status, admin_notes, reviewed_at, created_at`,
       [newStatus, adminNotes, req.user.id, id]
     );
 
