@@ -77,7 +77,8 @@ async function updateCategoryRequest(req, res) {
       `SELECT id, title, status,
               COALESCE(request_type, 'category') AS request_type,
               parent_category,
-              emoji
+              emoji,
+              requested_by
        FROM category_requests WHERE id = $1`,
       [id]
     );
@@ -168,6 +169,35 @@ async function updateCategoryRequest(req, res) {
         await persistTwemojiIconForKey(saved.title, emojiHint, { overwrite: false });
       } catch (iconErr) {
         console.warn('[admin category-requests] icon persist:', iconErr.message);
+      }
+    }
+
+    // Notify the requester — especially important on rejection with the admin note
+    if (row.requested_by) {
+      try {
+        const reason = adminNotes || saved.admin_notes || null;
+        let message;
+        if (action === 'reject') {
+          const where =
+            requestType === 'subcategory' && row.parent_category
+              ? `“${row.title}” under ${row.parent_category}`
+              : `“${row.title}”`;
+          message = reason
+            ? `Your category request ${where} was rejected. Reason: ${reason}`
+            : `Your category request ${where} was rejected.`;
+        } else {
+          const where =
+            requestType === 'subcategory' && row.parent_category
+              ? `“${row.title}” under ${row.parent_category}`
+              : `“${row.title}”`;
+          message = `Your category request ${where} was approved and is now available when creating a field.`;
+        }
+        await pool.query(
+          `INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)`,
+          [row.requested_by, message, 'category_request']
+        );
+      } catch (notifyErr) {
+        console.warn('[admin category-requests] notify requester:', notifyErr.message);
       }
     }
 

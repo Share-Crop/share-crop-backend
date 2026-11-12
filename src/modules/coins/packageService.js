@@ -57,21 +57,51 @@ async function upsertCurrencyRate(currencyData, adminUserId) {
 }
 
 /**
- * Delete currency rate (soft delete by setting is_active = false)
+ * Activate or deactivate a currency rate (does not delete the row).
  */
-async function deleteCurrencyRate(currency, adminUserId) {
+async function setCurrencyRateActive(currency, isActive, adminUserId) {
   const result = await pool.query(
-    `UPDATE currency_rates 
-     SET is_active = false, updated_by = $2, updated_at = CURRENT_TIMESTAMP
+    `UPDATE currency_rates
+     SET is_active = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
      WHERE currency = $1
      RETURNING *`,
-    [currency.toUpperCase(), adminUserId]
+    [currency.toUpperCase(), Boolean(isActive), adminUserId]
   );
-  
+
   if (result.rows.length === 0) {
     throw new Error('Currency rate not found');
   }
-  
+
+  return result.rows[0];
+}
+
+/**
+ * Permanently delete a currency rate.
+ * Blocked when coin packages still reference the currency.
+ */
+async function deleteCurrencyRate(currency, adminUserId) {
+  const code = currency.toUpperCase();
+
+  const packageCheck = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM coin_packages WHERE currency = $1`,
+    [code]
+  );
+  const packageCount = packageCheck.rows[0]?.count || 0;
+  if (packageCount > 0) {
+    throw new Error(
+      `Cannot delete ${code}: ${packageCount} coin package(s) still use it. Deactivate the currency or remove those packages first.`
+    );
+  }
+
+  const result = await pool.query(
+    `DELETE FROM currency_rates WHERE currency = $1 RETURNING *`,
+    [code]
+  );
+
+  if (result.rows.length === 0) {
+    throw new Error('Currency rate not found');
+  }
+
   return result.rows[0];
 }
 
@@ -334,6 +364,7 @@ module.exports = {
   getCurrencyRates,
   getAllCurrencyRates,
   upsertCurrencyRate,
+  setCurrencyRateActive,
   deleteCurrencyRate,
   getActivePackages,
   getAllPackages,

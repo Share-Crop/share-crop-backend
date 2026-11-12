@@ -77,6 +77,7 @@ router.delete('/packages/:id', adminPackageController.deletePackage);
 router.get('/currency-rates', adminPackageController.listCurrencyRates);
 router.post('/currency-rates', adminPackageController.upsertCurrencyRate);
 router.patch('/currency-rates/:currency', adminPackageController.upsertCurrencyRate);
+router.patch('/currency-rates/:currency/active', adminPackageController.setCurrencyRateActive);
 router.delete('/currency-rates/:currency', adminPackageController.deleteCurrencyRate);
 
 // Product / crop category icons (Supabase URL stored in DB; upload from admin UI)

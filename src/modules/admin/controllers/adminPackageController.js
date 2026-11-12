@@ -154,18 +154,45 @@ async function upsertCurrencyRate(req, res) {
 }
 
 /**
- * Delete currency rate (admin - soft delete)
+ * Activate / deactivate currency rate (admin)
+ */
+async function setCurrencyRateActive(req, res) {
+  try {
+    const { currency } = req.params;
+    const adminUserId = req.user.id;
+    if (typeof req.body?.is_active !== 'boolean') {
+      return res.status(400).json({ error: 'is_active (boolean) is required' });
+    }
+    const rate = await packageService.setCurrencyRateActive(currency, req.body.is_active, adminUserId);
+    res.json({
+      rate,
+      message: req.body.is_active ? 'Currency activated' : 'Currency deactivated',
+    });
+  } catch (err) {
+    if (err.message === 'Currency rate not found') {
+      return res.status(404).json({ error: err.message });
+    }
+    console.error('Error updating currency active state:', err);
+    res.status(500).json({ error: 'Server Error', message: err.message });
+  }
+}
+
+/**
+ * Permanently delete currency rate (admin)
  */
 async function deleteCurrencyRate(req, res) {
   try {
     const { currency } = req.params;
     const adminUserId = req.user.id;
-    
+
     const rate = await packageService.deleteCurrencyRate(currency, adminUserId);
-    res.json({ rate, message: 'Currency rate deactivated successfully' });
+    res.json({ rate, message: 'Currency rate deleted permanently' });
   } catch (err) {
     if (err.message === 'Currency rate not found') {
       return res.status(404).json({ error: err.message });
+    }
+    if (/Cannot delete/i.test(err.message)) {
+      return res.status(409).json({ error: err.message });
     }
     console.error('Error deleting currency rate:', err);
     res.status(500).json({ error: 'Server Error', message: err.message });
@@ -180,5 +207,6 @@ module.exports = {
   deletePackage,
   listCurrencyRates,
   upsertCurrencyRate,
+  setCurrencyRateActive,
   deleteCurrencyRate,
 };
