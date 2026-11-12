@@ -83,6 +83,8 @@ router.delete('/currency-rates/:currency', adminPackageController.deleteCurrency
 router.get('/product-category-icons', adminProductIconsController.list);
 router.put('/product-category-icons', adminProductIconsController.upsert);
 router.delete('/product-category-icons', adminProductIconsController.remove);
+router.post('/product-category-icons/backfill-twemoji', adminProductIconsController.backfillTwemoji);
+router.post('/product-category-icons/twemoji', adminProductIconsController.saveTwemojiForKey);
 
 // Category requests (farmer-submitted titles awaiting approval)
 const adminCategoryRequestsController = require('../controllers/adminCategoryRequestsController');

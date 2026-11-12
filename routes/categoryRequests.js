@@ -7,6 +7,7 @@ const {
   findParentKey,
   hasSubInParent,
 } = require('../src/modules/categories/fieldCategories');
+const { resolveEmojiForTitle } = require('../src/modules/categories/subcategoryEmojis');
 
 /** Public (or any logged-in) catalog: static + approved custom titles. */
 router.get('/field-categories', async (_req, res) => {
@@ -19,6 +20,14 @@ router.get('/field-categories', async (_req, res) => {
   }
 });
 
+/** Suggest emoji + Twemoji PNG for a typed product-type / category title. */
+router.get('/emoji-suggest', (req, res) => {
+  const q = String(req.query.q || req.query.title || '').trim();
+  if (q.length < 2) return res.json({ suggestion: null });
+  const suggestion = resolveEmojiForTitle(q);
+  res.json({ suggestion });
+});
+
 router.post('/category-requests', authenticate, async (req, res) => {
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'Unauthorized' });
@@ -28,6 +37,12 @@ router.post('/category-requests', authenticate, async (req, res) => {
     const title = String(req.body?.title || '').trim().replace(/\s+/g, ' ');
     const parentRaw =
       req.body?.parent_category != null ? String(req.body.parent_category).trim().replace(/\s+/g, ' ') : '';
+    const bodyEmoji =
+      req.body?.emoji != null && String(req.body.emoji).trim()
+        ? String(req.body.emoji).trim()
+        : null;
+    const resolved = resolveEmojiForTitle(title);
+    const emoji = bodyEmoji || resolved?.emoji || null;
 
     if (title.length < 2 || title.length > 80) {
       return res.status(400).json({
@@ -76,10 +91,10 @@ router.post('/category-requests', authenticate, async (req, res) => {
       }
 
       const insert = await pool.query(
-        `INSERT INTO category_requests (title, request_type, parent_category, requested_by, status)
-         VALUES ($1, 'category', NULL, $2, 'pending')
-         RETURNING id, title, request_type, parent_category, status, created_at`,
-        [title, req.user.id]
+        `INSERT INTO category_requests (title, request_type, parent_category, emoji, requested_by, status)
+         VALUES ($1, 'category', NULL, $2, $3, 'pending')
+         RETURNING id, title, request_type, parent_category, emoji, status, created_at`,
+        [title, emoji, req.user.id]
       );
       return res.status(201).json(insert.rows[0]);
     }
@@ -133,10 +148,10 @@ router.post('/category-requests', authenticate, async (req, res) => {
     }
 
     const insert = await pool.query(
-      `INSERT INTO category_requests (title, request_type, parent_category, requested_by, status)
-       VALUES ($1, 'subcategory', $2, $3, 'pending')
-       RETURNING id, title, request_type, parent_category, status, created_at`,
-      [title, parentKey, req.user.id]
+      `INSERT INTO category_requests (title, request_type, parent_category, emoji, requested_by, status)
+       VALUES ($1, 'subcategory', $2, $3, $4, 'pending')
+       RETURNING id, title, request_type, parent_category, emoji, status, created_at`,
+      [title, parentKey, emoji, req.user.id]
     );
     res.status(201).json(insert.rows[0]);
   } catch (err) {
@@ -145,7 +160,7 @@ router.post('/category-requests', authenticate, async (req, res) => {
     }
     if (err.code === '42703') {
       return res.status(503).json({
-        error: 'Category request upgrade is not applied yet. Ask an admin to run migration 056.',
+        error: 'Category request upgrade is not applied yet. Ask an admin to run migrations 056/057.',
       });
     }
     console.error('[category-requests] create:', err.message);
@@ -157,7 +172,7 @@ router.get('/category-requests/mine', authenticate, async (req, res) => {
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'Unauthorized' });
     const result = await pool.query(
-      `SELECT id, title, COALESCE(request_type, 'category') AS request_type, parent_category,
+      `SELECT id, title, COALESCE(request_type, 'category') AS request_type, parent_category, emoji,
               status, admin_notes, created_at, reviewed_at
        FROM category_requests
        WHERE requested_by = $1

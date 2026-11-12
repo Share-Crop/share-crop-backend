@@ -4,6 +4,8 @@ const {
   findParentKey,
   hasSubInParent,
 } = require('../../categories/fieldCategories');
+const { persistTwemojiIconForKey } = require('../../categories/persistTwemojiIcon');
+const { resolveEmojiForTitle, twemojiPngUrl } = require('../../categories/subcategoryEmojis');
 
 async function listCategoryRequests(req, res) {
   try {
@@ -22,6 +24,7 @@ async function listCategoryRequests(req, res) {
         cr.title,
         COALESCE(cr.request_type, 'category') AS request_type,
         cr.parent_category,
+        cr.emoji,
         cr.status,
         cr.admin_notes,
         cr.requested_by,
@@ -42,7 +45,15 @@ async function listCategoryRequests(req, res) {
     `;
 
     const result = await pool.query(sql, params);
-    res.json(result.rows);
+    const rows = result.rows.map((row) => {
+      const emoji = row.emoji || resolveEmojiForTitle(row.title)?.emoji || null;
+      return {
+        ...row,
+        emoji,
+        twemoji_url: emoji ? twemojiPngUrl(emoji) : null,
+      };
+    });
+    res.json(rows);
   } catch (err) {
     console.error('[admin category-requests] list:', err.message);
     res.status(500).json({ error: 'Server Error' });
@@ -65,7 +76,8 @@ async function updateCategoryRequest(req, res) {
     const existing = await pool.query(
       `SELECT id, title, status,
               COALESCE(request_type, 'category') AS request_type,
-              parent_category
+              parent_category,
+              emoji
        FROM category_requests WHERE id = $1`,
       [id]
     );
@@ -139,7 +151,7 @@ async function updateCategoryRequest(req, res) {
            reviewed_at = NOW()
        WHERE id = $4 AND status = 'pending'
        RETURNING id, title, COALESCE(request_type, 'category') AS request_type,
-                 parent_category, status, admin_notes, reviewed_at, created_at`,
+                 parent_category, emoji, status, admin_notes, reviewed_at, created_at`,
       [newStatus, adminNotes, req.user.id, id]
     );
 
@@ -147,7 +159,19 @@ async function updateCategoryRequest(req, res) {
       return res.status(409).json({ error: 'Request was already processed' });
     }
 
-    res.json(updated.rows[0]);
+    const saved = updated.rows[0];
+
+    // Permanently store Twemoji PNG URL for the product type (same key Create Field uses)
+    if (action === 'approve') {
+      try {
+        const emojiHint = saved.emoji || resolveEmojiForTitle(saved.title)?.emoji || null;
+        await persistTwemojiIconForKey(saved.title, emojiHint, { overwrite: false });
+      } catch (iconErr) {
+        console.warn('[admin category-requests] icon persist:', iconErr.message);
+      }
+    }
+
+    res.json(saved);
   } catch (err) {
     if (err.code === '23505') {
       return res.status(409).json({ error: 'Category title conflict' });
