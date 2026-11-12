@@ -10,8 +10,7 @@ const STATIC_FIELD_CATEGORY_DATA = {
   'Fish & Seafood': ['Bivalves & Clams', 'Crab', 'Fish', 'Lobster', 'Octopus & Squid', 'Shrimp'],
   'Frozen Foods': ['Fish', 'Ice cream', 'Pizza', 'Potatoes', 'Ready Meals'],
   Fruits: [
-    'Green Apple',
-    'Red Apple',
+    'Apple',
     'Peach',
     'Strawberry',
     'Tangerine',
