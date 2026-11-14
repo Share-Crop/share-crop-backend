@@ -40,7 +40,6 @@ const SUBCATEGORY_EMOJI_MAP = {
   Blueberries: '🫐',
   Melon: '🍈',
   Orange: '🍊',
-  Apple: '🍎',
   Kino: '🍊',
   Quince: '🍐',
   Fig: '🟤',
